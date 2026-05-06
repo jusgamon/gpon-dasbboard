@@ -1,0 +1,29 @@
+Role: You are a Senior Python Developer and Network Engineer.
+Task: Build a "Proof of Concept" (PoC) Monitoring Dashboard for a GPON/IMS network. The goal is to demonstrate how theoretical models (QoS and M/M/1) are applied to practical network monitoring.
+1. Backend Requirements (Python & Flask)
+Create a Flask application (app.py) that includes:
+
+Data Source: Create a function to simulate real-time network data (CPU usage %, Jitter in ms, Delay in ms, and Traffic Rate $\lambda$) or read from a simple CSV.
+QoS Logic: Implement a function to calculate a QoS score using the formula: $$QoS = 100 - (0.4 \times Delay + 0.3 \times Jitter + 0.3 \times CPU)$$
+Mathematical Model (M/M/1): Implement the M/M/1 queuing theory formula to predict waiting time ($W$): $$W = \frac{1}{\mu - \lambda}$$ (Assume a fixed service rate $\mu = 10$ for the simulation).
+Status Logic: Categorize the system state based on the QoS score:
+Normal: QoS > 80
+Warning: 50 < QoS $\le$ 80
+Critical: QoS $\le$ 50
+Use Socket/API structure to deliver real time data
+Use sql database if required
+Make functions configurable to test features or limits
+Frontend Requirements (HTML/CSS/JS)
+Create a modern, clean dashboard (index.html) using Bootstrap and Chart.js:
+
+Metric Cards: Display current CPU, Jitter, Delay, and the calculated QoS score with color-coded status badges.
+Visualizations:
+A Line Chart showing the trend of CPU and Delay over time.
+A Gauge or Bar showing the current QoS Score.
+An M/M/1 Graph showing how delay increases exponentially as traffic ($\lambda$) approaches service capacity ($\mu$).
+Auto-Refresh: Use JavaScript setInterval or Fetch API to update the data every 3-5 seconds to simulate a live environment(or use socket to receive real time data every 3-5 seconds)
+Deliverables
+
+Provide the complete app.py code.
+Provide the index.html (including embedded CSS and JS for simplicity).
+Provide a sample data.csv or sql structure.

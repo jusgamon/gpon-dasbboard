@@ -1,29 +1,96 @@
-Role: You are a Senior Python Developer and Network Engineer.
-Task: Build a "Proof of Concept" (PoC) Monitoring Dashboard for a GPON/IMS network. The goal is to demonstrate how theoretical models (QoS and M/M/1) are applied to practical network monitoring.
-1. Backend Requirements (Python & Flask)
-Create a Flask application (app.py) that includes:
+# 📄 agent.md: Intelligent GPON/IMS Orchestration Prototype Plan
 
-Data Source: Create a function to simulate real-time network data (CPU usage %, Jitter in ms, Delay in ms, and Traffic Rate $\lambda$) or read from a simple CSV.
-QoS Logic: Implement a function to calculate a QoS score using the formula: $$QoS = 100 - (0.4 \times Delay + 0.3 \times Jitter + 0.3 \times CPU)$$
-Mathematical Model (M/M/1): Implement the M/M/1 queuing theory formula to predict waiting time ($W$): $$W = \frac{1}{\mu - \lambda}$$ (Assume a fixed service rate $\mu = 10$ for the simulation).
-Status Logic: Categorize the system state based on the QoS score:
-Normal: QoS > 80
-Warning: 50 < QoS $\le$ 80
-Critical: QoS $\le$ 50
-Use Socket/API structure to deliver real time data
-Use sql database if required
-Make functions configurable to test features or limits
-Frontend Requirements (HTML/CSS/JS)
-Create a modern, clean dashboard (index.html) using Bootstrap and Chart.js:
+## 🎯 Project Objective
+To develop a conceptual prototype for a **Network-Aware Service Adaptation** system that bridges the gap between GPON access networks and IMS (IP Multimedia Subsystem) services. The goal is to move beyond passive monitoring into active, intelligent orchestration.
 
-Metric Cards: Display current CPU, Jitter, Delay, and the calculated QoS score with color-coded status badges.
-Visualizations:
-A Line Chart showing the trend of CPU and Delay over time.
-A Gauge or Bar showing the current QoS Score.
-An M/M/1 Graph showing how delay increases exponentially as traffic ($\lambda$) approaches service capacity ($\mu$).
-Auto-Refresh: Use JavaScript setInterval or Fetch API to update the data every 3-5 seconds to simulate a live environment(or use socket to receive real time data every 3-5 seconds)
-Deliverables
 
-Provide the complete app.py code.
-Provide the index.html (including embedded CSS and JS for simplicity).
-Provide a sample data.csv or sql structure.
+
+---
+
+## 🧠 Logic Flow: The "Closed-Loop" System
+Unlike traditional systems that only display data, this agent-driven prototype follows a four-stage cognitive process:
+1.  **Monitoring:** Collecting simulated telemetry (CPU, Jitter, Traffic).
+2.  **Analysis:** Evaluating the impact of network health on specific IMS services (VoIP, Video).
+3.  **Decision:** Applying heuristic rules to determine necessary interventions.
+4.  **Optimization:** Executing or suggesting adaptive actions (QoS boost, Bandwidth reservation).
+
+---
+
+## 🛠 Technical Stack
+*   **Backend:** Python (Flask) - Handling the logic engine and data simulation.
+*   **Frontend:** HTML5, CSS3, JavaScript - For the interactive dashboard.
+*   **Visualization:** Chart.js - Real-time network health graphing.
+*   **Data Source:** Simulated Real-time Data (Randomized but within logical bounds).
+
+---
+
+## 📊 Data & Service Matrices
+
+### 1. Input Parameters (Telemetry)
+| Parameter | Source | Description |
+| :--- | :--- | :--- |
+| **CPU Load** | Simulated | Processing health of the OLT/VNF |
+| **Jitter** | Simulated | Latency variation (Critical for VoIP) |
+| **Traffic Load** | Simulated | Total throughput utilization |
+| **IMS Session Count** | Simulated | Active VoIP/Video call sessions |
+
+### 2. Service Priority Mapping
+| Service Type | Priority | Requirement |
+| :--- | :--- | :--- |
+| **VoIP** | HIGH | Low Jitter (<20ms) |
+| **Video** | MEDIUM | Stable Bandwidth |
+| **Web/Data** | LOW | Best-effort delivery |
+
+---
+
+## ⚙️ Decision Engine (The "Intelligence")
+The core logic resides in a rules-based adaptation engine:
+
+```python
+# Conceptual Logic Snippet
+if jitter > 25 and voip_sessions > 10:
+    action = "ACTIVATE_VOIP_PRIORITY_QOS"
+    status = "CRITICAL"
+elif cpu_load > 85:
+    action = "LOAD_BALANCE_TRAFFIC"
+    status = "WARNING"
+else:
+    action = "NO_ACTION_REQUIRED"
+    status = "STABLE"
+```
+
+---
+
+## 🎨 Dashboard Requirements (UI/UX)
+1.  **Topology View:** A visual map showing `OLT -> ONUs -> IMS Core` with color-coded status (Green/Yellow/Red).
+2.  **Telemetry Charts:** Real-time line charts for Jitter and CPU.
+3.  **Action Center:** A log window showing "Intelligent Decisions" made by the system (e.g., *"System detected high jitter; applied QoS Tag 46 to VoIP traffic"*).
+
+---
+
+## 🚀 Thesis Value Proposition (The "Defense" Pitch)
+> "This prototype demonstrates an **Adaptive IMS Service Orchestrator** over GPON. It proves that by making the application layer 'network-aware,' we can preemptively mitigate quality degradation through automated QoS adjustments, moving from reactive maintenance to proactive orchestration."
+
+---
+
+## 📅 Roadmap for MVP (Minimum Viable Product)
+*   **Phase 1:** Setup Flask server and simulated data generators.
+*   **Phase 2:** Implement the `analyze_network()` logic engine.
+*   **Phase 3:** Create the Dashboard UI with Topology and Charts.
+*   **Phase 4:** Connect the frontend to the backend logic via AJAX/Websockets for real-time updates.
+
+---
+
+**Status:** Ready for implementation.
+**Role:** This document serves as the primary context for the AI Agent to generate code and architectural advice.
+
+---
+
+## Implementation Notes for Current Prototype Revision
+1. Use Socket.IO as the primary live data channel.
+2. Load history once on connect, then stream incremental metric updates from the socket.
+3. Do not poll `/api/snapshot` every second from the client unless a deliberate fallback is reintroduced later.
+4. Avoid full-card flash animations on every update; keep metric refresh visually stable.
+5. Show human-readable local browser time in the top-right clock and localised times in the event log labels.
+6. Start the background publisher with Flask-SocketIO background task helpers instead of a raw Python thread so the dev server remains stable.
+7. Keep the prototype clean and reliable; fancy interactions are optional, clarity is required.

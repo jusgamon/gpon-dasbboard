@@ -181,12 +181,12 @@
     .badge-warning  { background: rgba(255,184,48,.12); color: var(--warning); border: 1px solid rgba(255,184,48,.25); }
     .badge-critical { background: rgba(255,69,96,.12);  color: var(--critical); border: 1px solid rgba(255,69,96,.25); }
 
-    /* Flash animation on update */
-    @keyframes flash-update {
-      0%   { background: rgba(0,180,255,.12); }
-      100% { background: var(--bg-card); }
+    .metric-value,
+    .status-badge,
+    #gauge-score-label,
+    #gauge-status-label {
+      transition: color .2s ease, opacity .2s ease, transform .2s ease;
     }
-    .metric-card.flash { animation: flash-update .6s ease-out; }
 
     /* ── Chart panels ────────────────────────────────── */
     .chart-panel {
@@ -262,7 +262,7 @@
     </div>
   </div>
   <div class="header-right">
-    <span id="clock">--:--:-- UTC</span>
+    <span id="clock">--:--:-- LOCAL</span>
     <span id="conn-badge" class="conn-off">● CONNECTING</span>
   </div>
 </header>
@@ -410,7 +410,7 @@
 /* ── Clock ──────────────────────────────────── */
 function updateClock() {
   document.getElementById('clock').textContent =
-    new Date().toUTCString().split(' ').slice(4,5)[0] + ' UTC';
+    new Date().toLocaleTimeString([], { hour12: false }) + ' LOCAL';
 }
 setInterval(updateClock, 1000);
 updateClock();
@@ -423,6 +423,8 @@ Chart.defaults.font.size     = 10;
 
 const MAX_TREND_PTS = 40;
 const MAX_BAR_PTS   = 20;
+let historyLoaded = false;
+let lastSnapshotTs = null;
 
 /* ── Trend Line Chart (CPU + Delay) ─────────── */
 const trendCtx = document.getElementById('chart-trend').getContext('2d');
@@ -536,18 +538,18 @@ function setGauge(score, status) {
 function badgeClass(status) {
   return { Normal: 'badge-normal', Warning: 'badge-warning', Critical: 'badge-critical' }[status] || '';
 }
-function cardFlash(id) {
-  const el = document.getElementById(id);
-  el.classList.remove('flash');
-  void el.offsetWidth;  // reflow
-  el.classList.add('flash');
+function formatLocalTime(ts) {
+  if (!ts) return '--';
+  const dt = new Date(ts);
+  if (Number.isNaN(dt.getTime())) return '--';
+  return dt.toLocaleTimeString([], { hour12: false });
 }
 
 /* ── Log helper ─────────────────────────────── */
 const logEl = document.getElementById('live-log');
 function addLog(snap) {
   const cls = { Normal: 'log-normal', Warning: 'log-warning', Critical: 'log-critical' }[snap.status] || '';
-  const ts  = snap.ts ? snap.ts.split('T')[1].replace('Z','') : '--';
+  const ts  = formatLocalTime(snap.ts);
   const entry = document.createElement('div');
   entry.className = 'log-entry';
   entry.innerHTML = `<span class="log-ts">${ts}</span>` +
@@ -567,8 +569,7 @@ function qosBgColor(score) {
 }
 
 /* ── Push snapshot to UI ────────────────────── */
-function applySnapshot(snap) {
-  // Cards
+function updateMetricCards(snap) {
   document.getElementById('v-cpu').textContent    = snap.cpu.toFixed(1);
   document.getElementById('v-jitter').textContent = snap.jitter.toFixed(1);
   document.getElementById('v-delay').textContent  = snap.delay.toFixed(1);
@@ -580,21 +581,17 @@ function applySnapshot(snap) {
   const sb = document.getElementById('v-status');
   sb.textContent = snap.status;
   sb.className   = 'status-badge ' + badgeClass(snap.status);
+}
 
-  ['card-cpu','card-jitter','card-delay','card-lambda','card-wq','card-qos']
-    .forEach(cardFlash);
-
-  // Gauge
-  setGauge(snap.qos, snap.status);
-
-  // Trend chart
-  const lbl = (snap.ts || '').split('T')[1]?.slice(0,8) || '--';
+function appendSnapshotToCharts(snap) {
+  const lbl = formatLocalTime(snap.ts);
   const { labels: tl, datasets: td } = trendChart.data;
-  tl.push(lbl);           td[0].data.push(snap.cpu);  td[1].data.push(snap.delay);
+  tl.push(lbl);
+  td[0].data.push(snap.cpu);
+  td[1].data.push(snap.delay);
   if (tl.length > MAX_TREND_PTS) { tl.shift(); td[0].data.shift(); td[1].data.shift(); }
   trendChart.update('none');
 
-  // QoS Bar chart
   const { labels: ql, datasets: qd } = qosBarChart.data;
   ql.push(lbl);
   qd[0].data.push(snap.qos);
@@ -604,14 +601,20 @@ function applySnapshot(snap) {
   }
   qosBarChart.update('none');
 
-  // M/M/1 current marker
   const wCur = isFinite(snap.wq) ? snap.wq : null;
   mm1Chart.data.datasets[1].data = wCur !== null
     ? [{ x: snap.lambda_, y: wCur }] : [];
   mm1Chart.update('none');
+}
 
-  // Log
-  addLog(snap);
+function applySnapshot(snap, options = {}) {
+  if (!snap || !snap.ts || snap.ts === lastSnapshotTs) return;
+  lastSnapshotTs = snap.ts;
+
+  updateMetricCards(snap);
+  setGauge(snap.qos, snap.status);
+  if (!options.skipCharts) appendSnapshotToCharts(snap);
+  if (!options.skipLog) addLog(snap);
 }
 
 /* ── Load M/M/1 theoretical curve ──────────── */
@@ -631,8 +634,11 @@ async function loadMM1Curve() {
 
 /* ── Load history on boot ───────────────────── */
 function applyHistory(rows) {
+  if (historyLoaded) return;
+  historyLoaded = true;
+
   rows.forEach(r => {
-    const lbl = (r.ts || '--').split('T')[1]?.slice(0,8) || '--';
+    const lbl = formatLocalTime(r.ts);
     // Trend
     trendChart.data.labels.push(lbl);
     trendChart.data.datasets[0].data.push(r.cpu);
@@ -659,11 +665,11 @@ function applyHistory(rows) {
   qosBarChart.update('none');
 
   // Apply latest as live snapshot
-  if (rows.length) applySnapshot(rows[rows.length - 1]);
+  if (rows.length) applySnapshot(rows[rows.length - 1], { skipCharts: true, skipLog: true });
 }
 
 /* ── Socket.IO ──────────────────────────────── */
-const socket = io({ transports: ['websocket','polling'] });
+const socket = io({ transports: ['websocket', 'polling'], reconnection: true });
 
 socket.on('connect', () => {
   const badge = document.getElementById('conn-badge');
@@ -675,21 +681,10 @@ socket.on('disconnect', () => {
   badge.textContent = '● OFFLINE';
   badge.className   = 'conn-off';
 });
-socket.on('history',       rows => applyHistory(rows));
+socket.on('history', rows => applyHistory(rows));
 socket.on('metric_update', snap => applySnapshot(snap));
 
 /* ── Polling fallback (if socket fails) ─────── */
-let socketWorking = false;
-socket.on('connect', () => { socketWorking = true; });
-
-setInterval(async () => {
-  if (socketWorking && socket.connected) return;
-  try {
-    const res  = await fetch('/api/snapshot');
-    const snap = await res.json();
-    applySnapshot(snap);
-  } catch(e) {}
-}, 1000);
 
 /* ── Initialise static data ─────────────────── */
 loadMM1Curve();

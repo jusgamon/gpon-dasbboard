@@ -1,7 +1,3 @@
-"""
-GPON/IMS Network Monitoring Dashboard backend.
-"""
-
 import csv
 import math
 import os
@@ -20,7 +16,7 @@ app.config["SECRET_KEY"] = "gpon-ims-poc-secret"
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="threading",
+    async_mode="eventlet",
     logger=False,
     engineio_logger=False,
     ping_interval=20,
@@ -55,28 +51,28 @@ CONFIG = {
 
 ACTION_LIBRARY = {
     "observe": {
-        "service": "All Services",
-        "priority": "LOW",
-        "patch": "No patch required. Keep baseline transport policy active.",
+        "service": "Bütün xidmətlər",
+        "priority": "AŞAĞI",
+        "patch": "Yamaq tələb olunmur. Əsas nəqliyyat siyasətini aktiv saxlayın.",
     },
     "rtp_priority_qos": {
         "service": "VoIP",
-        "priority": "HIGH",
+        "priority": "YÜKSƏK",
         "patch": "cli: qos policy update class VOIP set dscp ef queue strict-priority",
     },
     "increase_bandwidth_reservation": {
         "service": "Video",
-        "priority": "MEDIUM",
+        "priority": "ORTA",
         "patch": "config: ims.video.reservation=+15% and gpon.tcont.video.assured_bw=boost",
     },
     "load_balance_secondary": {
-        "service": "Transport",
-        "priority": "HIGH",
+        "service": "Nəqliyyat",
+        "priority": "YÜKSƏK",
         "patch": "cli: orchestrator rebalance --target secondary-vnf --drain best-effort 20%",
     },
     "preemptive_shaping": {
-        "service": "Transport",
-        "priority": "HIGH",
+        "service": "Nəqliyyat",
+        "priority": "YÜKSƏK",
         "patch": "cli: traffic-shaper apply profile preemptive_guard --window 30s",
     },
 }
@@ -123,7 +119,7 @@ _telemetry_window = deque(maxlen=120)
 _sim_state = None
 _decision_state = {
     "last_action": None,
-    "last_result": "No action evaluated yet.",
+    "last_result": "Hələ heç bir əməliyyat qiymətləndirilməyib.",
 }
 _emit_state = {
     "last_snapshot": None,
@@ -140,7 +136,6 @@ NORMAL_BOOTSTRAP = {
 
 
 def init_db():
-    """Create the metrics table if needed."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -166,7 +161,6 @@ def log_event(channel: str, message: str):
 
 
 def insert_metric(snapshot: dict):
-    """Persist the history fields needed by the charts."""
     row = {
         "ts": snapshot["ts"],
         "cpu": snapshot["cpu"],
@@ -189,7 +183,6 @@ def insert_metric(snapshot: dict):
 
 
 def fetch_history(limit=60):
-    """Return latest history rows ordered oldest-first."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -311,7 +304,6 @@ def parse_ts_epoch(ts_value: str) -> float:
 
 
 def seed_runtime_state():
-    """Use DB history for continuity while bootstrapping the live simulation in a healthy state."""
     global _sim_state
 
     history = fetch_history(12)
@@ -383,7 +375,6 @@ def init_sim_state():
 
 
 def simulate_metrics() -> dict:
-    """Generate smoother, more realistic telemetry with configurable chaos."""
     global _sim_state
     if _sim_state is None:
         _sim_state = init_sim_state()
@@ -467,7 +458,6 @@ def simulate_metrics() -> dict:
 
 
 def get_raw_metrics() -> dict:
-    """Return a raw metric sample from the configured data source."""
     if CONFIG["DATA_SOURCE"] == "csv":
         if not _csv_reader_state["rows"]:
             _load_csv()
@@ -602,28 +592,30 @@ def build_decision_object(
     lambda_ratio = raw["lambda_"] / max(CONFIG["MU"], 0.001)
 
     if action_key == "rtp_priority_qos":
-        diagnosis = "IMS VoIP sessions are suffering from rising jitter under active voice load."
+        diagnosis = "Aktiv səs yükü zamanı IMS VoIP sessiyalarında artan jitter problemi müşahidə olunur."
     elif action_key == "increase_bandwidth_reservation":
-        diagnosis = "IMS video sessions are degrading due to delay growth coupled with CPU pressure."
+        diagnosis = "CPU yüklənməsi və gecikmə artımı səbəbindən IMS video sessiyalarının keyfiyyəti zəifləyir."
     elif action_key == "load_balance_secondary":
-        diagnosis = "Transport stress is building as traffic intensity approaches service capacity."
+        diagnosis = "Trafik intensivliyi xidmət tutumuna yaxınlaşdığı üçün nəqliyyat yükü artır."
     elif action_key == "preemptive_shaping":
-        diagnosis = "Queue growth is projecting toward saturation before hard limits are reached."
+        diagnosis = "Növbə artımı kritik limitlərə çatmadan əvvəl doyma vəziyyətinə yaxınlaşır."
     else:
-        diagnosis = "No immediate service degradation is dominating the current telemetry window."
+        diagnosis = "Cari telemetriya intervalında dominant xidmət problemi müşahidə olunmur."
 
     rationale_sentences = [
-        f"Jitter is changing by {gradients['jitter']:.2f} ms per second, delay by {gradients['delay']:.2f} ms per second, and CPU by {gradients['cpu']:.2f} percent per second over the last 10 seconds.",
-        f"The VoIP Service Health Index is {shi['voip']:.1f} and the Video Service Health Index is {shi['video']:.1f}.",
-        f"Traffic intensity is running at lambda over mu = {lambda_ratio:.2f}.",
+        f"Son 10 saniyə ərzində jitter saniyədə {gradients['jitter']:.2f} ms, gecikmə {gradients['delay']:.2f} ms və CPU istifadəsi {gradients['cpu']:.2f}% dəyişib.",
+        f"VoIP Xidmət Sağlamlıq İndeksi {shi['voip']:.1f}, Video Xidmət Sağlamlıq İndeksi isə {shi['video']:.1f}-dir.",
+        f"Trafik intensivliyi lambda/mu = {lambda_ratio:.2f} səviyyəsində işləyir.",
     ]
+
     if math.isfinite(queue_projection["projected_wq_30s_ms"]):
         rationale_sentences.append(
-            f"The projected queue wait in 30 seconds is {queue_projection['projected_wq_30s_ms']:.1f} ms."
+            f"30 saniyə sonra proqnozlaşdırılan növbə gözləmə müddəti {queue_projection['projected_wq_30s_ms']:.1f} ms-dir."
         )
+
     if math.isfinite(queue_projection["time_to_saturation_s"]):
         rationale_sentences.append(
-            f"At the current gradient, time to saturation is approximately {queue_projection['time_to_saturation_s']:.1f} seconds."
+            f"Cari trendə əsasən doyma vəziyyətinə çatma müddəti təxminən {queue_projection['time_to_saturation_s']:.1f} saniyədir."
         )
 
     return {
@@ -637,7 +629,7 @@ def build_decision_object(
         "proposed_patch": template["patch"],
         "confidence_score": round(confidence, 2),
         "optimization_result": optimization_result,
-        "analysis": f"Total IMS sessions={total_sessions}, VoIP={voip_load}, Video={video_load}.",
+        "analysis": f"Ümumi IMS sessiyaları={total_sessions}, VoIP={voip_load}, Video={video_load}.",
         "decision": diagnosis,
         "optimization": template["patch"],
     }
@@ -645,12 +637,14 @@ def build_decision_object(
 
 def assess_closed_loop(action_key: str, raw: dict, gradients: dict, shi: dict, queue_projection: dict) -> str:
     last_action = _decision_state["last_action"]
+
     if not last_action or last_action["scenario"] != action_key:
         return _decision_state["last_result"]
 
     elapsed = time.time() - last_action["applied_at"]
+
     if elapsed < 6:
-        return "Action applied; waiting for post-change telemetry."
+        return "Əməliyyat tətbiq edildi; dəyişiklikdən sonrakı telemetriya gözlənilir."
 
     baseline = last_action["baseline"]
     improved = 0
@@ -660,16 +654,26 @@ def assess_closed_loop(action_key: str, raw: dict, gradients: dict, shi: dict, q
         checks += 2
         improved += raw["jitter"] <= baseline["jitter"]
         improved += shi["voip"] >= baseline["shi_voip"]
+
     elif action_key == "increase_bandwidth_reservation":
         checks += 2
         improved += raw["delay"] <= baseline["delay"]
         improved += shi["video"] >= baseline["shi_video"]
+
     else:
         checks += 2
         improved += raw["lambda_"] <= baseline["lambda_"]
-        improved += queue_projection["projected_wq_30s_ms"] <= baseline["projected_wq_30s_ms"]
+        improved += (
+            queue_projection["projected_wq_30s_ms"]
+            <= baseline["projected_wq_30s_ms"]
+        )
 
-    result = "Optimization Successful" if improved >= max(1, checks - 1) else "Action Ineffective; Escalating."
+    result = (
+        "Optimizasiya uğurla tamamlandı"
+        if improved >= max(1, checks - 1)
+        else "Əməliyyat təsirsiz oldu; eskalasiya edilir."
+    )
+
     _decision_state["last_result"] = result
     return result
 
@@ -816,7 +820,6 @@ def normalize_config_value(key: str, value):
 
 
 def ensure_push_loop():
-    """Start the metric publisher once for the current process."""
     global _push_thread
     with _push_lock:
         if _push_thread is None:

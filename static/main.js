@@ -394,41 +394,73 @@ async function loadMM1Curve() {
     }
 }
 
+
+const badge = document.getElementById("conn-badge");
+
+let hasEverConnected = false;
+
+function setStatus(state) {
+    if (state === "connecting") {
+        badge.textContent = "QOŞULUR";
+        badge.className = "header-pill conn-warn";
+    }
+
+    if (state === "online") {
+        badge.textContent = "CANLI";
+        badge.className = "header-pill conn-on";
+    }
+
+    if (state === "offline") {
+        badge.textContent = "OFFLAYN";
+        badge.className = "header-pill conn-off";
+    }
+}
+
+// initial state
+setStatus("connecting");
+
 const socket = io({
-    transports: ["websocket"],
-    upgrade: true,
+    transports: ["polling", "websocket"],
     reconnection: true,
     reconnectionAttempts: Infinity,
     reconnectionDelay: 1500
 });
 
 socket.on("connect", () => {
-    console.log("[socket] qoşuldu", socket.id);
-    const badge = document.getElementById("conn-badge");
-    badge.textContent = "CANLI";
-    badge.className = "header-pill conn-on";
+    hasEverConnected = true;
+    setStatus("online");
 });
 
-socket.on("disconnect", () => {
-    console.warn("[socket] ayrıldı");
-    const badge = document.getElementById("conn-badge");
-    badge.textContent = "OFFLAYN";
-    badge.className = "header-pill conn-off";
+socket.on("disconnect", (reason) => {
+    console.warn("[socket] disconnect:", reason);
+
+    // critical fix: don't show OFFLINE on first startup noise
+    if (!hasEverConnected) {
+        setStatus("connecting");
+        return;
+    }
+
+    setStatus("offline");
 });
 
-socket.on("connect_error", (error) => {
-    console.error("[socket] xəta", error?.message || error);
+socket.on("connect_error", () => {
+    setStatus("connecting");
 });
 
-socket.on("reconnect_attempt", (attempt) => {
-    console.warn("[socket] yenidən qoşulma cəhdi", attempt);
+socket.on("reconnect_attempt", () => {
+    setStatus("connecting");
+});
+
+socket.on("reconnect", () => {
+    hasEverConnected = true;
+    setStatus("online");
 });
 
 socket.on("bootstrap_data", (payload) => {
     console.log("[socket] ilkin məlumat alındı");
     applyBootstrap(payload);
     if (payload?.snapshot) {
-    applySnapshot(payload.snapshot, { skipCharts: true, skipLog: true });
+        applySnapshot(payload.snapshot, { skipCharts: true, skipLog: true });
     }
 });
 

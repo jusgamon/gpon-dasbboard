@@ -6,7 +6,6 @@
   <title>GPON/IMS Network Monitor</title>
 
   <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@500;600;700&family=Inter:wght@400;500&display=swap" rel="stylesheet" />
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 
@@ -166,6 +165,22 @@
       flex: 1;
       height: 1px;
       background: linear-gradient(90deg, var(--border), transparent);
+    }
+
+    .g-3 {
+      row-gap: 1rem;
+    }
+
+    .mb-3 {
+      margin-bottom: 1rem;
+    }
+
+    .mb-4 {
+      margin-bottom: 1.5rem;
+    }
+
+    .mt-2 {
+      margin-top: 0.5rem;
     }
 
     .metric-card,
@@ -481,6 +496,62 @@
         min-height: 235px;
       }
     }
+
+    /* ROW */
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem; /* modern spacing instead of negative margins */
+    }
+
+
+    /* BASE COLUMN (mobile-first) */
+    [class*="col-"] {
+      flex: 0 0 100%;
+      max-width: 100%;
+    }
+
+    /* SMALL DEVICES */
+    .col-6 {
+      flex: 0 0 calc(50% - 0.5rem);
+      max-width: calc(50% - 0.5rem);
+    }
+
+    /* MEDIUM DEVICES */
+    @media (min-width: 768px) {
+      .col-md-3 {
+        flex: 0 0 calc(25% - 0.75rem);
+        max-width: calc(25% - 0.75rem);
+      }
+
+      .col-md-4 {
+        flex: 0 0 calc(33.3333% - 0.75rem);
+        max-width: calc(33.3333% - 0.75rem);
+      }
+    }
+
+    /* LARGE DEVICES */
+    @media (min-width: 992px) {
+      .col-lg-3 {
+        flex: 0 0 calc(25% - 0.75rem);
+        max-width: calc(25% - 0.75rem);
+      }
+
+      .col-lg-4 {
+        flex: 0 0 calc(33.3333% - 0.75rem);
+        max-width: calc(33.3333% - 0.75rem);
+      }
+
+      .col-lg-5 {
+        flex: 0 0 calc(41.6667% - 0.75rem);
+        max-width: calc(41.6667% - 0.75rem);
+      }
+
+      .col-lg-7 {
+        flex: 0 0 calc(58.3333% - 0.75rem);
+        max-width: calc(58.3333% - 0.75rem);
+      }
+    }
   </style>
 </head>
 <body>
@@ -643,18 +714,19 @@
         <span id="action-scenario" class="mini-badge badge-normal">SCENARIO: OBSERVE</span>
         <span id="action-priority" class="mini-badge badge-warning">PRIORITY: LOW</span>
         <span id="action-service" class="mini-badge badge-normal">SERVICE: ALL SERVICES</span>
+        <span id="action-confidence" class="mini-badge badge-normal">CONFIDENCE: 0.00</span>
       </div>
       <div class="action-grid">
         <div class="action-step">
-          <div class="action-step-label">Analysis</div>
+          <div class="action-step-label">Diagnosis</div>
           <div id="action-analysis" class="action-step-text">Waiting for live telemetry.</div>
         </div>
         <div class="action-step">
-          <div class="action-step-label">Decision</div>
+          <div class="action-step-label">Rationale</div>
           <div id="action-decision" class="action-step-text">Waiting for live telemetry.</div>
         </div>
         <div class="action-step">
-          <div class="action-step-label">Optimization</div>
+          <div class="action-step-label">Proposed Patch</div>
           <div id="action-optimization" class="action-step-text">Waiting for live telemetry.</div>
         </div>
       </div>
@@ -662,7 +734,6 @@
     </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
   <script>
     function updateClock() {
       document.getElementById("clock").textContent =
@@ -681,6 +752,7 @@
     const ARC_LEN = 345.6;
     let historyLoaded = false;
     let lastSnapshotTs = null;
+    let currentSnapshot = null;
 
     function chartPadding() {
       return { top: 6, right: 12, bottom: 18, left: 8 };
@@ -872,6 +944,28 @@
       label.className = status === "Critical" ? "log-critical" : status === "Warning" ? "log-warning" : "log-normal";
     }
 
+    function mergeSnapshot(partialSnapshot) {
+      if (!currentSnapshot) {
+        currentSnapshot = {
+          service_sessions: { voip: 0, video: 0, web: 0 },
+          action_center: null
+        };
+      }
+
+      currentSnapshot = {
+        ...currentSnapshot,
+        ...partialSnapshot,
+        service_sessions: {
+          ...(currentSnapshot.service_sessions || {}),
+          ...(partialSnapshot.service_sessions || {})
+        },
+        action_center: partialSnapshot.action_center
+          ? { ...(currentSnapshot.action_center || {}), ...partialSnapshot.action_center }
+          : currentSnapshot.action_center
+      };
+      return currentSnapshot;
+    }
+
     function updateMetricCards(snapshot) {
       document.getElementById("v-cpu").textContent = snapshot.cpu.toFixed(1);
       document.getElementById("v-jitter").textContent = snapshot.jitter.toFixed(1);
@@ -897,6 +991,7 @@
       const scenarioEl = document.getElementById("action-scenario");
       const priorityEl = document.getElementById("action-priority");
       const serviceEl = document.getElementById("action-service");
+      const confidenceEl = document.getElementById("action-confidence");
 
       modeEl.textContent = `MODE: ${action.mode.toUpperCase()}`;
       modeEl.className = `mini-badge ${action.mode === "manual" ? "badge-warning" : "badge-normal"}`;
@@ -910,11 +1005,14 @@
       serviceEl.textContent = `SERVICE: ${action.service.toUpperCase()}`;
       serviceEl.className = "mini-badge badge-normal";
 
-      document.getElementById("action-analysis").textContent = action.analysis;
-      document.getElementById("action-decision").textContent = action.decision;
-      document.getElementById("action-optimization").textContent = action.optimization;
+      confidenceEl.textContent = `CONFIDENCE: ${Number(action.confidence_score ?? 0).toFixed(2)}`;
+      confidenceEl.className = `mini-badge ${Number(action.confidence_score ?? 0) >= 0.75 ? "badge-critical" : Number(action.confidence_score ?? 0) >= 0.5 ? "badge-warning" : "badge-normal"}`;
+
+      document.getElementById("action-analysis").textContent = action.diagnosis || action.analysis;
+      document.getElementById("action-decision").textContent = action.rationale || action.decision;
+      document.getElementById("action-optimization").textContent = action.proposed_patch || action.optimization;
       document.getElementById("action-footer").textContent =
-        `Configurable through /api/config for testing and preview. Current status: ${snapshot.status}.`;
+        `${action.optimization_result || "No closed-loop result yet."} Current status: ${snapshot.status}.`;
     }
 
     const logEl = document.getElementById("live-log");
@@ -923,12 +1021,14 @@
       const actionName = snapshot.action_center?.scenario
         ? snapshot.action_center.scenario.toUpperCase()
         : "SNAPSHOT";
+      const confidence = snapshot.action_center?.confidence_score;
       const entry = document.createElement("div");
       entry.className = "log-entry";
       entry.innerHTML =
         `<span class="log-ts">${formatLocalTime(snapshot.ts)}</span>` +
         `<span class="${status === "Critical" ? "log-critical" : status === "Warning" ? "log-warning" : "log-normal"}">[${status}]</span> ` +
-        `${actionName} | QoS=${Number(snapshot.qos).toFixed(1)} CPU=${Number(snapshot.cpu).toFixed(1)}% Delay=${Number(snapshot.delay).toFixed(1)}ms`;
+        `${actionName} | QoS=${Number(snapshot.qos).toFixed(1)} CPU=${Number(snapshot.cpu).toFixed(1)}% Delay=${Number(snapshot.delay).toFixed(1)}ms` +
+        `${confidence !== undefined ? ` C=${Number(confidence).toFixed(2)}` : ""}`;
       logEl.prepend(entry);
       while (logEl.children.length > 60) {
         logEl.removeChild(logEl.lastChild);
@@ -969,23 +1069,25 @@
 
     function applySnapshot(snapshot, options = {}) {
       if (!snapshot || !snapshot.ts || snapshot.ts === lastSnapshotTs) return;
-      lastSnapshotTs = snapshot.ts;
+      const merged = mergeSnapshot(snapshot);
+      lastSnapshotTs = merged.ts;
 
-      updateMetricCards(snapshot);
-      updateActionCenter(snapshot);
-      setGauge(snapshot.qos, snapshot.status);
-      updateMm1Marker(snapshot);
+      updateMetricCards(merged);
+      updateActionCenter(merged);
+      setGauge(merged.qos, merged.status);
+      updateMm1Marker(merged);
 
       if (!options.skipCharts) {
-        appendTrendPoint(snapshot);
-        appendQosPoint(snapshot);
+        appendTrendPoint(merged);
+        appendQosPoint(merged);
       }
       if (!options.skipLog) {
-        addLog(snapshot);
+        addLog(merged);
       }
     }
 
-    function applyHistory(rows) {
+    function applyBootstrap(payload) {
+      const rows = payload?.history || [];
       if (historyLoaded) return;
       historyLoaded = true;
 
@@ -1029,22 +1131,43 @@
       }
     }
 
-    const socket = io({ transports: ["websocket", "polling"], reconnection: true });
+    const socket = io({
+      transports: ["websocket"],
+      upgrade: true,
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1500
+    });
 
     socket.on("connect", () => {
+      console.log("[socket] connected", socket.id);
       const badge = document.getElementById("conn-badge");
       badge.textContent = "LIVE";
       badge.className = "header-pill conn-on";
     });
 
     socket.on("disconnect", () => {
+      console.warn("[socket] disconnected");
       const badge = document.getElementById("conn-badge");
       badge.textContent = "OFFLINE";
       badge.className = "header-pill conn-off";
     });
 
-    socket.on("history", (rows) => applyHistory(rows));
-    socket.on("current_snapshot", (snapshot) => applySnapshot(snapshot, { skipCharts: true, skipLog: true }));
+    socket.on("connect_error", (error) => {
+      console.error("[socket] connect_error", error?.message || error);
+    });
+
+    socket.on("reconnect_attempt", (attempt) => {
+      console.warn("[socket] reconnect_attempt", attempt);
+    });
+
+    socket.on("bootstrap_data", (payload) => {
+      console.log("[socket] bootstrap_data received");
+      applyBootstrap(payload);
+      if (payload?.snapshot) {
+        applySnapshot(payload.snapshot, { skipCharts: true, skipLog: true });
+      }
+    });
     socket.on("metric_update", (snapshot) => applySnapshot(snapshot));
 
     loadMM1Curve();

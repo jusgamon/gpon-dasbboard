@@ -12,9 +12,6 @@ from collections import deque
 from datetime import datetime, timezone
 from threading import Lock
 
-import eventlet
-eventlet.monkey_patch()
-
 from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO, emit
 
@@ -24,14 +21,11 @@ app.config["SECRET_KEY"] = "gpon-ims-poc-secret"
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="eventlet",
-    json=None,
+    async_mode="threading",   # safest cross-platform option
     logger=False,
     engineio_logger=False,
     ping_interval=25,
     ping_timeout=120,
-    allow_upgrades=True,
-    binary=False,
 )
 
 # ═══════════════════════════════════════════════════════════════════

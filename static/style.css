@@ -564,6 +564,11 @@ canvas {
   color: white;
 }
 
+.debug-btn.danger {
+    background: #d50000;
+    color: white;
+}
+
 @media (max-width: 991px) {
     header {
     flex-direction: column;
@@ -612,27 +617,23 @@ canvas {
     }
 }
 
-/* ROW */
 .row {
     display: flex;
     flex-wrap: wrap;
-    gap: 1rem; /* modern spacing instead of negative margins */
+    gap: 1rem;
 }
 
 
-/* BASE COLUMN (mobile-first) */
 [class*="col-"] {
     flex: 0 0 100%;
     max-width: 100%;
 }
 
-/* SMALL DEVICES */
 .col-6 {
     flex: 0 0 calc(50% - 0.5rem);
     max-width: calc(50% - 0.5rem);
 }
 
-/* MEDIUM DEVICES */
 @media (min-width: 768px) {
     .col-md-3 {
     flex: 0 0 calc(25% - 0.75rem);
@@ -645,7 +646,6 @@ canvas {
     }
 }
 
-/* LARGE DEVICES */
 @media (min-width: 992px) {
     .col-lg-3 {
     flex: 0 0 calc(25% - 0.75rem);

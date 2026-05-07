@@ -394,11 +394,6 @@ async function loadMM1Curve() {
     }
 }
 
-
-// ═════════════════════════════════════════════════════════════
-// DEBUG MODAL
-// ═════════════════════════════════════════════════════════════
-
 const debugModal = document.getElementById("debug-modal");
 
 const debugButton = document.getElementById("debug-button");
@@ -409,32 +404,8 @@ const debugRefreshBtn = document.getElementById("debug-refresh-btn");
 
 const debugSaveBtn = document.getElementById("debug-save-btn");
 
+const debugResetBtn = document.getElementById("debug-reset-btn")
 
-// ─────────────────────────────────────────────────────────────
-// OPEN
-// ─────────────────────────────────────────────────────────────
-
-debugButton.addEventListener("click", async () => {
-
-  debugModal.classList.remove("hidden");
-
-  await loadConfig();
-});
-
-
-// ─────────────────────────────────────────────────────────────
-// CLOSE
-// ─────────────────────────────────────────────────────────────
-
-debugCloseBtn.addEventListener("click", () => {
-
-  debugModal.classList.add("hidden");
-});
-
-
-// ─────────────────────────────────────────────────────────────
-// LOAD CONFIG
-// ─────────────────────────────────────────────────────────────
 
 async function loadConfig() {
 
@@ -488,16 +459,20 @@ async function loadConfig() {
 }
 
 
-// ─────────────────────────────────────────────────────────────
-// REFRESH
-// ─────────────────────────────────────────────────────────────
+debugButton.addEventListener("click", async () => {
+
+  debugModal.classList.remove("hidden");
+
+  await loadConfig();
+});
+
+debugCloseBtn.addEventListener("click", () => {
+
+  debugModal.classList.add("hidden");
+});
+
 
 debugRefreshBtn.addEventListener("click", loadConfig);
-
-
-// ─────────────────────────────────────────────────────────────
-// SAVE
-// ─────────────────────────────────────────────────────────────
 
 debugSaveBtn.addEventListener("click", async () => {
 
@@ -580,8 +555,6 @@ debugSaveBtn.addEventListener("click", async () => {
 
   const data = await res.json();
 
-  console.log(data);
-
   if (data.ok) {
     await loadMM1Curve()
     alert("CONFIG UPDATED");
@@ -595,10 +568,30 @@ debugSaveBtn.addEventListener("click", async () => {
   }
 });
 
+debugResetBtn.addEventListener("click", async () => {
+  const confirmed = window.confirm(
+    "Are you sure you want to reset the simulation? This will clear all runtime state."
+  );
 
-// ─────────────────────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────────────────────
+  if (!confirmed) return;
+
+  try {
+    const response = await fetch("/api/reset", {
+      method: "POST",
+    });
+
+    if (!response.ok) {
+      throw new Error("Reset failed");
+    }
+
+    console.log("Simulation reset successful");
+
+    await loadConfig();
+  } catch (err) {
+    console.error(err);
+    alert("Failed to reset simulation");
+  }
+});
 
 function setValue(key, value) {
 
@@ -638,9 +631,17 @@ function getRange(key) {
 }
 
 
-const badge = document.getElementById("conn-badge");
+if (window.socket) {
+    console.log("Cleaning up existing socket connection");
+    window.socket.removeAllListeners();
+    window.socket.disconnect();
+    window.socket = null;
+}
 
+const badge = document.getElementById("conn-badge");
 let hasEverConnected = false;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
 
 function setStatus(state) {
     if (state === "connecting") {
@@ -651,6 +652,7 @@ function setStatus(state) {
     if (state === "online") {
         badge.textContent = "CANLI";
         badge.className = "header-pill conn-on";
+        reconnectAttempts = 0;
     }
 
     if (state === "offline") {
@@ -659,25 +661,34 @@ function setStatus(state) {
     }
 }
 
-// initial state
 setStatus("connecting");
 
-const socket = io({
+const socket = window.socket ?? io({
     transports: ["websocket"],
     upgrade: false,
     reconnection: true,
-    reconnectionAttempts: Infinity,
-    reconnectionDelay: 1500,
-    forceNew: true
+    reconnectionAttempts: MAX_RECONNECT_ATTEMPTS,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 5000,
+    timeout: 20000
 });
 
+window.socket = socket;
+
 socket.on("connect", () => {
+    console.log("[socket] Connected successfully with ID:", socket.id);
     hasEverConnected = true;
     setStatus("online");
+    reconnectAttempts = 0;
 });
 
 socket.on("disconnect", (reason) => {
     console.warn("[socket] disconnect:", reason);
+
+    if (reason === "io client disconnect") {
+        console.log("Normal client disconnect");
+        return;
+    }
 
     if (!hasEverConnected) {
         setStatus("connecting");
@@ -689,28 +700,44 @@ socket.on("disconnect", (reason) => {
 
 socket.on("connect_error", (err) => {
     console.warn("Socket error:", err.message);
-    setStatus("connecting");
-    socket.disconnect();
-    setTimeout(() => socket.connect(), 1000);
+    reconnectAttempts++;
+    
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        console.error("Max reconnection attempts reached");
+        setStatus("offline");
+    } else {
+        setStatus("connecting");
+    }
 });
 
-socket.on("reconnect_attempt", () => {
+socket.on("reconnect_attempt", (attemptNumber) => {
+    console.log(`Reconnection attempt ${attemptNumber}`);
     setStatus("connecting");
 });
 
-socket.on("reconnect", () => {
+socket.on("reconnect", (attemptNumber) => {
+    console.log(`Reconnected after ${attemptNumber} attempts`);
     hasEverConnected = true;
     setStatus("online");
+    reconnectAttempts = 0;
+});
+
+socket.on("reconnect_failed", () => {
+    console.error("Reconnection failed");
+    setStatus("offline");
 });
 
 socket.on("bootstrap_data", (payload) => {
-    console.log("[socket] ilkin məlumat alındı");
+    console.log("[socket] Bootstrap data received");
     applyBootstrap(payload);
     if (payload?.snapshot) {
         applySnapshot(payload.snapshot, { skipCharts: true, skipLog: true });
     }
 });
 
-socket.on("metric_update", (snapshot) => applySnapshot(snapshot));
+socket.on("metric_update", (snapshot) => {
+    console.log("[socket] Metric update received");
+    applySnapshot(snapshot);
+});
 
 loadMM1Curve();

@@ -583,7 +583,7 @@ debugSaveBtn.addEventListener("click", async () => {
   console.log(data);
 
   if (data.ok) {
-
+    await loadMM1Curve()
     alert("CONFIG UPDATED");
 
   } else {

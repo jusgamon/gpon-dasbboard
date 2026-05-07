@@ -263,7 +263,7 @@ function updateActionCenter(snapshot) {
     scenarioEl.className = `mini-badge ${statusClass(snapshot.status)}`;
 
     priorityEl.textContent = `PRİORİTET: ${action.priority}`;
-    priorityEl.className = `mini-badge ${action.priority === "HIGH" ? "badge-critical" : action.priority === "MEDIUM" ? "badge-warning" : "badge-normal"}`;
+    priorityEl.className = `mini-badge ${action.priority === "YÜKSƏK" || action.priority === "KRİTİK" ? "badge-critical" : action.priority === "ORTA" ? "badge-warning" : "badge-normal"}`;
 
     serviceEl.textContent = `XİDMƏT: ${action.service.toUpperCase()}`;
     serviceEl.className = "mini-badge badge-normal";
@@ -392,6 +392,249 @@ async function loadMM1Curve() {
     } catch (error) {
     console.warn("M/M/1 əyrisi yüklənmədi", error);
     }
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// DEBUG MODAL
+// ═════════════════════════════════════════════════════════════
+
+const debugModal = document.getElementById("debug-modal");
+
+const debugButton = document.getElementById("debug-button");
+
+const debugCloseBtn = document.getElementById("debug-close-btn");
+
+const debugRefreshBtn = document.getElementById("debug-refresh-btn");
+
+const debugSaveBtn = document.getElementById("debug-save-btn");
+
+
+// ─────────────────────────────────────────────────────────────
+// OPEN
+// ─────────────────────────────────────────────────────────────
+
+debugButton.addEventListener("click", async () => {
+
+  debugModal.classList.remove("hidden");
+
+  await loadConfig();
+});
+
+
+// ─────────────────────────────────────────────────────────────
+// CLOSE
+// ─────────────────────────────────────────────────────────────
+
+debugCloseBtn.addEventListener("click", () => {
+
+  debugModal.classList.add("hidden");
+});
+
+
+// ─────────────────────────────────────────────────────────────
+// LOAD CONFIG
+// ─────────────────────────────────────────────────────────────
+
+async function loadConfig() {
+
+  const res = await fetch("/api/config");
+
+  const data = await res.json();
+
+  const cfg = data.config;
+
+  setValue("MU", cfg.MU);
+
+  setValue("PUSH_INTERVAL", cfg.PUSH_INTERVAL);
+
+  setValue("DATA_SOURCE", cfg.DATA_SOURCE);
+
+  setValue("CSV_PATH", cfg.CSV_PATH);
+
+  setRange("CPU_RANGE", cfg.CPU_RANGE);
+
+  setRange("JITTER_RANGE", cfg.JITTER_RANGE);
+
+  setRange("DELAY_RANGE", cfg.DELAY_RANGE);
+
+  setRange("LAMBDA_RANGE", cfg.LAMBDA_RANGE);
+
+  setRange("IMS_SESSION_RANGE", cfg.IMS_SESSION_RANGE);
+
+  setValue("W_DELAY", cfg.W_DELAY);
+
+  setValue("W_JITTER", cfg.W_JITTER);
+
+  setValue("W_CPU", cfg.W_CPU);
+
+  setValue("SIMULATION_CHAOS", cfg.SIMULATION_CHAOS);
+
+  setValue("SIMULATION_MOMENTUM", cfg.SIMULATION_MOMENTUM);
+
+  setValue("VOIP_JITTER_THRESHOLD", cfg.VOIP_JITTER_THRESHOLD);
+
+  setValue("VIDEO_DELAY_THRESHOLD", cfg.VIDEO_DELAY_THRESHOLD);
+
+  setValue("CPU_WARNING_THRESHOLD", cfg.CPU_WARNING_THRESHOLD);
+
+  setValue("LAMBDA_WARNING_RATIO", cfg.LAMBDA_WARNING_RATIO);
+
+  setValue("ACTION_MODE", cfg.ACTION_MODE);
+
+  setValue("FORCED_ACTION", cfg.FORCED_ACTION);
+
+  setValue("FORCED_STATUS", cfg.FORCED_STATUS);
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// REFRESH
+// ─────────────────────────────────────────────────────────────
+
+debugRefreshBtn.addEventListener("click", loadConfig);
+
+
+// ─────────────────────────────────────────────────────────────
+// SAVE
+// ─────────────────────────────────────────────────────────────
+
+debugSaveBtn.addEventListener("click", async () => {
+
+  const payload = {
+
+    MU:
+      parseFloat(getValue("MU")),
+
+    PUSH_INTERVAL:
+      parseInt(getValue("PUSH_INTERVAL")),
+
+    DATA_SOURCE:
+      getValue("DATA_SOURCE"),
+
+    CSV_PATH:
+      getValue("CSV_PATH"),
+
+    CPU_RANGE:
+      getRange("CPU_RANGE"),
+
+    JITTER_RANGE:
+      getRange("JITTER_RANGE"),
+
+    DELAY_RANGE:
+      getRange("DELAY_RANGE"),
+
+    LAMBDA_RANGE:
+      getRange("LAMBDA_RANGE"),
+
+    IMS_SESSION_RANGE:
+      getRange("IMS_SESSION_RANGE"),
+
+    W_DELAY:
+      parseFloat(getValue("W_DELAY")),
+
+    W_JITTER:
+      parseFloat(getValue("W_JITTER")),
+
+    W_CPU:
+      parseFloat(getValue("W_CPU")),
+
+    SIMULATION_CHAOS:
+      parseFloat(getValue("SIMULATION_CHAOS")),
+
+    SIMULATION_MOMENTUM:
+      parseFloat(getValue("SIMULATION_MOMENTUM")),
+
+    VOIP_JITTER_THRESHOLD:
+      parseFloat(getValue("VOIP_JITTER_THRESHOLD")),
+
+    VIDEO_DELAY_THRESHOLD:
+      parseFloat(getValue("VIDEO_DELAY_THRESHOLD")),
+
+    CPU_WARNING_THRESHOLD:
+      parseFloat(getValue("CPU_WARNING_THRESHOLD")),
+
+    LAMBDA_WARNING_RATIO:
+      parseFloat(getValue("LAMBDA_WARNING_RATIO")),
+
+    ACTION_MODE:
+      getValue("ACTION_MODE"),
+
+    FORCED_ACTION:
+      getValue("FORCED_ACTION"),
+
+    FORCED_STATUS:
+      getValue("FORCED_STATUS"),
+  };
+
+  const res = await fetch("/api/config", {
+
+    method: "POST",
+
+    headers: {
+      "Content-Type": "application/json"
+    },
+
+    body: JSON.stringify(payload)
+  });
+
+  const data = await res.json();
+
+  console.log(data);
+
+  if (data.ok) {
+
+    alert("CONFIG UPDATED");
+
+  } else {
+
+    alert(
+      "CONFIG ERROR:\n"
+      + JSON.stringify(data.rejected, null, 2)
+    );
+  }
+});
+
+
+// ─────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────
+
+function setValue(key, value) {
+
+  const el = document.getElementById(`cfg-${key}`);
+
+  if (el) {
+    el.value = value;
+  }
+}
+
+function getValue(key) {
+
+  const el = document.getElementById(`cfg-${key}`);
+
+  return el ? el.value : null;
+}
+
+function setRange(key, value) {
+
+  document.getElementById(`cfg-${key}-min`).value = value[0];
+
+  document.getElementById(`cfg-${key}-max`).value = value[1];
+}
+
+function getRange(key) {
+
+  return [
+
+    parseFloat(
+      document.getElementById(`cfg-${key}-min`).value
+    ),
+
+    parseFloat(
+      document.getElementById(`cfg-${key}-max`).value
+    ),
+  ];
 }
 
 

@@ -23,6 +23,7 @@
     <div class="header-right">
       <span id="clock" class="header-pill">--:--:--</span>
       <span id="conn-badge" class="header-pill conn-off">BAĞLANIR</span>
+      <span id="debug-button" class="header-pill">SIMULATION MENU</span>
     </div>
   </header>
 
@@ -189,6 +190,263 @@
       </div>
       <div id="action-footer" class="action-footer">Test və ön baxış üçün /api/config vasitəsilə konfiqurasiya edilə bilər.</div>
     </div>
+  </div>
+
+  <div id="debug-modal" class="debug-modal hidden">
+
+    <div class="debug-modal-content">
+
+      <div class="debug-modal-header">
+        <div class="debug-modal-title">
+          DEBUG / CONFIG PANEL
+        </div>
+
+        <button id="debug-close-btn" class="debug-close-btn">
+          ✕
+        </button>
+      </div>
+
+      <div id="debug-form" class="debug-grid">
+
+        <div class="debug-field">
+          <label>
+            MU (Service Rate req/s)
+            <small>M/M/1 xidmət tutumu. Daha yüksək = daha çox trafik emalı.</small>
+          </label>
+
+          <input type="number" step="0.1" id="cfg-MU">
+        </div>
+
+        <div class="debug-field">
+          <label>
+            PUSH_INTERVAL (seconds)
+            <small>Frontend-ə telemetriya göndərmə intervalı.</small>
+          </label>
+
+          <input type="number" id="cfg-PUSH_INTERVAL">
+        </div>
+
+        <div class="debug-field">
+          <label>
+            DATA_SOURCE
+            <small>Məlumat mənbəyi: simulasiya və ya CSV faylı.</small>
+          </label>
+
+          <select id="cfg-DATA_SOURCE">
+            <option value="simulate">simulate</option>
+            <option value="csv">csv</option>
+          </select>
+        </div>
+
+        <div class="debug-field">
+          <label>
+            CSV_PATH
+            <small>CSV data source aktivdirsə istifadə olunan fayl yolu.</small>
+          </label>
+
+          <input type="text" id="cfg-CSV_PATH">
+        </div>
+
+        <div class="debug-field">
+          <label>
+            CPU_RANGE
+            <small>Simulyasiyada CPU istifadəsinin minimum və maksimum həddi.</small>
+          </label>
+
+          <div class="range-pair">
+            <input type="number" id="cfg-CPU_RANGE-min" placeholder="min">
+            <input type="number" id="cfg-CPU_RANGE-max" placeholder="max">
+          </div>
+        </div>
+
+        <div class="debug-field">
+          <label>
+            JITTER_RANGE
+            <small>VoIP jitter simulyasiya limiti (ms).</small>
+          </label>
+
+          <div class="range-pair">
+            <input type="number" id="cfg-JITTER_RANGE-min" placeholder="min">
+            <input type="number" id="cfg-JITTER_RANGE-max" placeholder="max">
+          </div>
+        </div>
+
+        <div class="debug-field">
+          <label>
+            DELAY_RANGE
+            <small>Şəbəkə gecikmə diapazonu (ms).</small>
+          </label>
+
+          <div class="range-pair">
+            <input type="number" id="cfg-DELAY_RANGE-min" placeholder="min">
+            <input type="number" id="cfg-DELAY_RANGE-max" placeholder="max">
+          </div>
+        </div>
+
+        <div class="debug-field">
+          <label>
+            LAMBDA_RANGE
+            <small>Giriş trafik intensivliyi diapazonu (λ).</small>
+          </label>
+
+          <div class="range-pair">
+            <input type="number" step="0.1" id="cfg-LAMBDA_RANGE-min" placeholder="min">
+            <input type="number" step="0.1" id="cfg-LAMBDA_RANGE-max" placeholder="max">
+          </div>
+        </div>
+
+        <div class="debug-field">
+          <label>
+            IMS_SESSION_RANGE
+            <small>Aktiv IMS sessiyalarının diapazonu.</small>
+          </label>
+
+          <div class="range-pair">
+            <input type="number" id="cfg-IMS_SESSION_RANGE-min" placeholder="min">
+            <input type="number" id="cfg-IMS_SESSION_RANGE-max" placeholder="max">
+          </div>
+        </div>
+
+        <div class="debug-field">
+          <label>
+            W_DELAY
+            <small>QoS hesabında delay təsir əmsalı.</small>
+          </label>
+
+          <input type="number" step="0.01" id="cfg-W_DELAY">
+        </div>
+
+        <div class="debug-field">
+          <label>
+            W_JITTER
+            <small>QoS hesabında jitter təsir əmsalı.</small>
+          </label>
+
+          <input type="number" step="0.01" id="cfg-W_JITTER">
+        </div>
+
+        <div class="debug-field">
+          <label>
+            W_CPU
+            <small>QoS hesabında CPU yük təsir əmsalı.</small>
+          </label>
+
+          <input type="number" step="0.01" id="cfg-W_CPU">
+        </div>
+
+        <div class="debug-field">
+          <label>
+            SIMULATION_CHAOS
+            <small>Təsadüfi şok və qeyri-sabitlik səviyyəsi.</small>
+          </label>
+
+          <input type="number" step="0.01" id="cfg-SIMULATION_CHAOS">
+        </div>
+
+        <div class="debug-field">
+          <label>
+            SIMULATION_MOMENTUM
+            <small>Əvvəlki trendin yeni telemetriyaya təsiri.</small>
+          </label>
+
+          <input type="number" step="0.01" id="cfg-SIMULATION_MOMENTUM">
+        </div>
+
+        <div class="debug-field">
+          <label>
+            VOIP_JITTER_THRESHOLD
+            <small>VoIP üçün kritik jitter həddi (ms).</small>
+          </label>
+
+          <input type="number" id="cfg-VOIP_JITTER_THRESHOLD">
+        </div>
+
+        <div class="debug-field">
+          <label>
+            VIDEO_DELAY_THRESHOLD
+            <small>Video trafik üçün delay xəbərdarlıq həddi.</small>
+          </label>
+
+          <input type="number" id="cfg-VIDEO_DELAY_THRESHOLD">
+        </div>
+
+        <div class="debug-field">
+          <label>
+            CPU_WARNING_THRESHOLD
+            <small>CPU warning trigger həddi (%).</small>
+          </label>
+
+          <input type="number" id="cfg-CPU_WARNING_THRESHOLD">
+        </div>
+
+        <div class="debug-field">
+          <label>
+            LAMBDA_WARNING_RATIO
+            <small>λ/μ warning trigger nisbəti.</small>
+          </label>
+
+          <input type="number" step="0.01" id="cfg-LAMBDA_WARNING_RATIO">
+        </div>
+
+        <div class="debug-field">
+          <label>
+            ACTION_MODE
+            <small>Qərar sistemi avtomatik və ya manual işləsin.</small>
+          </label>
+
+          <select id="cfg-ACTION_MODE">
+            <option value="auto">auto</option>
+            <option value="manual">manual</option>
+          </select>
+        </div>
+
+        <div class="debug-field">
+          <label>
+            FORCED_ACTION
+            <small>Manual rejimdə tətbiq ediləcək əməliyyat.</small>
+          </label>
+
+          <select id="cfg-FORCED_ACTION">
+            <option value="observe">observe</option>
+            <option value="rtp_priority_qos">rtp_priority_qos</option>
+            <option value="increase_bandwidth_reservation">increase_bandwidth_reservation</option>
+            <option value="load_balance_secondary">load_balance_secondary</option>
+            <option value="preemptive_shaping">preemptive_shaping</option>
+            <option value="fiber_degradation_alarm">fiber_degradation_alarm</option>
+            <option value="gpon_oversubscription">gpon_oversubscription</option>
+            <option value="traffic_anomaly">traffic_anomaly</option>
+          </select>
+        </div>
+
+        <div class="debug-field">
+          <label>
+            FORCED_STATUS
+            <small>Manual əməliyyatın severity statusu.</small>
+          </label>
+
+          <select id="cfg-FORCED_STATUS">
+            <option value="Normal">Normal</option>
+            <option value="Warning">Warning</option>
+            <option value="Critical">Critical</option>
+          </select>
+        </div>
+
+      </div>
+
+      <div class="debug-actions">
+
+        <button id="debug-refresh-btn" class="debug-btn secondary">
+          REFRESH
+        </button>
+
+        <button id="debug-save-btn" class="debug-btn primary">
+          SAVE CONFIG
+        </button>
+
+      </div>
+
+    </div>
+
   </div>
 
   <script src="/static/main.js"></script>

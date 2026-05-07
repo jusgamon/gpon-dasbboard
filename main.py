@@ -1,26 +1,3 @@
-"""
-GPON/IMS Network Monitoring Dashboard — Backend
-================================================
-Flask + SocketIO (eventlet) server.
-
-Sections
---------
-1.  Imports & app bootstrap
-2.  CONFIG & constants
-3.  Database helpers
-4.  Math / QoS / M/M/1 models
-5.  Simulation engine
-6.  Telemetry window & gradient analytics
-7.  Service-health & queue-projection helpers
-8.  Decision / action-center engine
-9.  Snapshot assembly
-10. Config normalisation helpers
-11. SocketIO push-loop
-12. Flask routes
-13. SocketIO event handlers
-14. Entry point
-"""
-
 # ═══════════════════════════════════════════════════════════════════
 # 1.  Imports & app bootstrap
 # ═══════════════════════════════════════════════════════════════════
@@ -36,7 +13,7 @@ from datetime import datetime, timezone
 from threading import Lock
 
 import eventlet
-eventlet.monkey_patch()                     # must happen before Flask/SocketIO
+eventlet.monkey_patch()
 
 from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO, emit
@@ -48,25 +25,12 @@ socketio = SocketIO(
     app,
     cors_allowed_origins="*",
     async_mode="eventlet",
-    # ── Parse-error fix ────────────────────────────────────────────
-    # The client was getting parse errors because the server defaulted
-    # to the binary "blob" payload type, which the browser Socket.IO
-    # client could not decode as JSON.  Forcing json serialiser here
-    # and disabling binary transport ensures every frame arrives as a
-    # plain UTF-8 JSON string.
-    json=None,                              # use default stdlib json
+    json=None,
     logger=False,
     engineio_logger=False,
-    # Keep-alive tuning — generous values reduce spurious disconnects
-    # that were triggering the client's "parse error / reconnect" loop.
     ping_interval=25,
     ping_timeout=120,
-    # Always start with polling so the handshake completes cleanly
-    # before upgrading; the client JS already requests the same order.
     allow_upgrades=True,
-    # Disable binary framing — force text frames only.
-    # This is the primary fix: binary frames look like parse errors to
-    # Socket.IO 4.x clients unless they explicitly opt in.
     binary=False,
 )
 
@@ -137,7 +101,7 @@ _UPDATABLE_KEYS = frozenset({
     "ACTION_MODE", "FORCED_ACTION", "FORCED_STATUS",
 })
 
-# Action library (text is in Azerbaijani as in the original)
+# Action library
 ACTION_LIBRARY: dict = {
     "observe": {
         "service":  "Bütün xidmətlər",
@@ -161,12 +125,12 @@ ACTION_LIBRARY: dict = {
     },
     "preemptive_shaping": {
         "service":  "Nəqliyyat",
-        "priority": "YÜKSEK",
+        "priority": "YÜKSƏK",
         "patch":    "cli: traffic-shaper apply profile preemptive_guard --window 30s",
     },
 }
 
-# Warm-boot reference values — keeps the sim from starting in a degraded state
+# Warm-boot reference values
 _NORMAL_BOOTSTRAP = {
     "cpu":      22.0,
     "jitter":    6.0,
@@ -294,8 +258,6 @@ def _init_sim_state() -> dict:
 
 
 def _seed_sim_from_history(history: list) -> dict:
-    """Blend the latest DB row toward the normal bootstrap so the
-    simulation always starts in a healthy-ish state."""
     if not history:
         return _init_sim_state()
 
@@ -331,7 +293,6 @@ def _seed_sim_from_history(history: list) -> dict:
 
 
 def seed_runtime_state() -> None:
-    """Call once at startup to warm the sim from DB history."""
     global _sim_state
     history = fetch_history(12)
 
@@ -351,10 +312,7 @@ def seed_runtime_state() -> None:
 
 
 def simulate_metrics() -> dict:
-    """Advance the simulation by one tick and return raw metric values.
-
-    Physics summary
-    ---------------
+    """
     - lambda follows a mean-reverting random walk driven by a momentum term.
     - Random shocks inject occasional bursts (probability scales with CHAOS).
     - CPU, jitter, and delay are each modelled as exponential smoothing
@@ -369,7 +327,6 @@ def simulate_metrics() -> dict:
     if _sim_state is None:
         _sim_state = _init_sim_state()
 
-    # Read config (validate to safe ranges)
     chaos    = max(0.0, min(1.5,  float(CONFIG["SIMULATION_CHAOS"])))
     momentum = max(0.0, min(0.97, float(CONFIG["SIMULATION_MOMENTUM"])))
     mu       = max(0.001, float(CONFIG["MU"]))
@@ -379,13 +336,11 @@ def simulate_metrics() -> dict:
     state["tick"] += 1
 
     # Shocks: probability of a new shock rises with chaos.
-    # Shock decays between ticks so it doesn't permanently offset the sim.
     if random.random() < 0.08 + chaos * 0.08:
         state["shock"] = random.uniform(-1.0, 1.0) * (0.18 + chaos * 0.95)
     else:
         state["shock"] *= 0.72
 
-    # Damp everything during warmup
     effective_chaos = chaos * (0.35 if warmup > 0 else 1.0)
     if warmup > 0:
         state["shock"] *= 0.35
@@ -1128,8 +1083,6 @@ def api_config():
 def on_connect():
     _ensure_push_loop()
     _log("socket", f"client connected  sid={request.sid}")
-    # Send the full current snapshot + recent history in one frame so
-    # the client can populate all charts before the first push-loop tick.
     snapshot = build_snapshot()
     emit("bootstrap_data", {
         "snapshot": snapshot,

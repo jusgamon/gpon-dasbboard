@@ -324,6 +324,14 @@ canvas {
     display: block;
 }
 
+#debug-button {
+    cursor: pointer;
+    transition: opacity 200ms ease-in-out;
+}
+#debug-button:hover {
+    opacity: 0.75;
+}
+
 #qos-gauge-wrap {
     display: flex;
     flex-direction: column;
@@ -436,6 +444,125 @@ canvas {
 .log-normal { color: var(--accent-green); }
 .log-warning { color: var(--accent-amber); }
 .log-critical { color: var(--accent-red); }
+
+.debug-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+
+  background: rgba(0,0,0,0.72);
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  padding: 20px;
+}
+
+.debug-modal.hidden {
+  display: none;
+}
+
+.debug-modal-content {
+  width: min(1200px, 95vw);
+  max-height: 92vh;
+
+  overflow-y: auto;
+
+  background: #0f1722;
+  border: 1px solid #243447;
+
+  border-radius: 18px;
+
+  padding: 24px;
+}
+
+.debug-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+
+  margin-bottom: 24px;
+}
+
+.debug-modal-title {
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.debug-close-btn {
+  border: none;
+  background: transparent;
+  color: white;
+  font-size: 22px;
+  cursor: pointer;
+}
+
+.debug-grid {
+  display: grid;
+
+  grid-template-columns:
+    repeat(auto-fill, minmax(240px, 1fr));
+
+  gap: 18px;
+}
+
+.debug-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.debug-field label {
+  font-size: 12px;
+  color: #8fa3b8;
+}
+
+.debug-field input,
+.debug-field select {
+  background: #17212e;
+  border: 1px solid #29394d;
+
+  color: white;
+
+  border-radius: 10px;
+
+  padding: 10px 12px;
+}
+
+.range-pair {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.debug-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+
+  margin-top: 24px;
+}
+
+.debug-btn {
+  border: none;
+  border-radius: 10px;
+
+  padding: 12px 18px;
+
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.debug-btn.primary {
+  background: #00c853;
+  color: white;
+}
+
+.debug-btn.secondary {
+  background: #2d3f54;
+  color: white;
+}
 
 @media (max-width: 991px) {
     header {

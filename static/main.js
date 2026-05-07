@@ -663,10 +663,12 @@ function setStatus(state) {
 setStatus("connecting");
 
 const socket = io({
-    transports: ["polling", "websocket"],
+    transports: ["websocket"],
+    upgrade: false,
     reconnection: true,
     reconnectionAttempts: Infinity,
-    reconnectionDelay: 1500
+    reconnectionDelay: 1500,
+    forceNew: true
 });
 
 socket.on("connect", () => {
@@ -677,7 +679,6 @@ socket.on("connect", () => {
 socket.on("disconnect", (reason) => {
     console.warn("[socket] disconnect:", reason);
 
-    // critical fix: don't show OFFLINE on first startup noise
     if (!hasEverConnected) {
         setStatus("connecting");
         return;
@@ -686,8 +687,11 @@ socket.on("disconnect", (reason) => {
     setStatus("offline");
 });
 
-socket.on("connect_error", () => {
+socket.on("connect_error", (err) => {
+    console.warn("Socket error:", err.message);
     setStatus("connecting");
+    socket.disconnect();
+    setTimeout(() => socket.connect(), 1000);
 });
 
 socket.on("reconnect_attempt", () => {

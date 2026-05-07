@@ -1077,6 +1077,7 @@ def api_config():
 def on_connect():
     _ensure_push_loop()
     _log("socket", f"client connected  sid={request.sid}")
+    _log("socket", f"active sockets: {len(socketio.server.manager.rooms.get("/", {}))}")
     snapshot = build_snapshot()
     emit("bootstrap_data", {
         "snapshot": snapshot,
@@ -1087,7 +1088,8 @@ def on_connect():
 @socketio.on("disconnect")
 def on_disconnect():
     _log("socket", f"client disconnected  sid={request.sid}")
-
+    _log("socket", f"active sockets: {len(socketio.server.manager.rooms.get("/", {}))}")
+    
 
 # ═══════════════════════════════════════════════════════════════════
 # 14. Entry point
@@ -1106,5 +1108,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=5000,
         debug=False,
-        allow_unsafe_werkzeug=True,
     )

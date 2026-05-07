@@ -1,3 +1,30 @@
+"""
+GPON/IMS Network Monitoring Dashboard — Backend
+================================================
+Flask + SocketIO (eventlet) server.
+
+Sections
+--------
+1.  Imports & app bootstrap
+2.  CONFIG & constants
+3.  Database helpers
+4.  Math / QoS / M/M/1 models
+5.  Simulation engine
+6.  Telemetry window & gradient analytics
+7.  Service-health & queue-projection helpers
+8.  Decision / action-center engine
+9.  Snapshot assembly
+10. Config normalisation helpers
+11. SocketIO push-loop
+12. Flask routes
+13. SocketIO event handlers
+14. Entry point
+"""
+
+# ═══════════════════════════════════════════════════════════════════
+# 1.  Imports & app bootstrap
+# ═══════════════════════════════════════════════════════════════════
+
 import csv
 import math
 import os
@@ -8,222 +35,215 @@ from collections import deque
 from datetime import datetime, timezone
 from threading import Lock
 
+import eventlet
+eventlet.monkey_patch()                     # must happen before Flask/SocketIO
+
 from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "gpon-ims-poc-secret"
+
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
     async_mode="eventlet",
+    # ── Parse-error fix ────────────────────────────────────────────
+    # The client was getting parse errors because the server defaulted
+    # to the binary "blob" payload type, which the browser Socket.IO
+    # client could not decode as JSON.  Forcing json serialiser here
+    # and disabling binary transport ensures every frame arrives as a
+    # plain UTF-8 JSON string.
+    json=None,                              # use default stdlib json
     logger=False,
     engineio_logger=False,
-    ping_interval=20,
-    ping_timeout=60,
+    # Keep-alive tuning — generous values reduce spurious disconnects
+    # that were triggering the client's "parse error / reconnect" loop.
+    ping_interval=25,
+    ping_timeout=120,
+    # Always start with polling so the handshake completes cleanly
+    # before upgrading; the client JS already requests the same order.
+    allow_upgrades=True,
+    # Disable binary framing — force text frames only.
+    # This is the primary fix: binary frames look like parse errors to
+    # Socket.IO 4.x clients unless they explicitly opt in.
+    binary=False,
 )
 
-CONFIG = {
-    "MU": 10.0,
-    "PUSH_INTERVAL": 2,
-    "DATA_SOURCE": "simulate",
+# ═══════════════════════════════════════════════════════════════════
+# 2.  CONFIG & constants
+# ═══════════════════════════════════════════════════════════════════
+
+CONFIG: dict = {
+    # ── M/M/1 model ─────────────────────────────────────────────────
+    "MU": 10.0,                     # service rate (requests / s)
+
+    # ── Push cadence ────────────────────────────────────────────────
+    "PUSH_INTERVAL": 2,             # seconds between SocketIO emits
+
+    # ── Data source ─────────────────────────────────────────────────
+    "DATA_SOURCE": "simulate",      # "simulate" | "csv"
     "CSV_PATH": "data.csv",
-    "CPU_RANGE": (8, 92),
-    "JITTER_RANGE": (2, 45),
-    "DELAY_RANGE": (5, 80),
-    "LAMBDA_RANGE": (1.5, 9.6),
+
+    # ── Simulation ranges (min, max) ────────────────────────────────
+    "CPU_RANGE":         (8,  92),
+    "JITTER_RANGE":      (2,  45),
+    "DELAY_RANGE":       (5,  80),
+    "LAMBDA_RANGE":      (1.5, 9.6),
     "IMS_SESSION_RANGE": (12, 84),
-    "MAX_HISTORY": 200,
-    "W_DELAY": 0.4,
+
+    # ── QoS formula weights  (W_DELAY*d + W_JITTER*j + W_CPU*c) ────
+    "W_DELAY":  0.4,
     "W_JITTER": 0.3,
-    "W_CPU": 0.3,
-    "SERVICE_WEIGHTS": {"voip": 0.4, "video": 0.35, "web": 0.25},
-    "SIMULATION_CHAOS": 0.22,
+    "W_CPU":    0.3,
+
+    # ── IMS service-mix (normalised internally) ──────────────────────
+    "SERVICE_WEIGHTS": {"voip": 0.40, "video": 0.35, "web": 0.25},
+
+    # ── Simulation physics ──────────────────────────────────────────
+    # CHAOS     - magnitude of random shocks (0 = smooth, 1.5 = wild)
+    # MOMENTUM  - how much previous velocity carries forward (0-0.97)
+    "SIMULATION_CHAOS":    0.22,
     "SIMULATION_MOMENTUM": 0.78,
-    "VOIP_JITTER_THRESHOLD": 20,
-    "VIDEO_DELAY_THRESHOLD": 28,
-    "CPU_WARNING_THRESHOLD": 85,
-    "LAMBDA_WARNING_RATIO": 0.82,
-    "ACTION_MODE": "auto",
-    "FORCED_ACTION": "observe",
-    "FORCED_STATUS": "Normal",
+
+    # ── Alert thresholds ────────────────────────────────────────────
+    "VOIP_JITTER_THRESHOLD":  20,   # ms above which VoIP SHI degrades
+    "VIDEO_DELAY_THRESHOLD":  28,   # ms above which Video SHI degrades
+    "CPU_WARNING_THRESHOLD":  85,   # % above which transport score rises
+    "LAMBDA_WARNING_RATIO":   0.82, # lambda/mu ratio above which load alarm fires
+
+    # ── Action-center mode ──────────────────────────────────────────
+    "ACTION_MODE":   "auto",        # "auto" | "manual"
+    "FORCED_ACTION": "observe",     # used only when ACTION_MODE = "manual"
+    "FORCED_STATUS": "Normal",      # used only when ACTION_MODE = "manual"
 }
 
-ACTION_LIBRARY = {
+# Keys whose POST values must be converted from list -> tuple
+_RANGE_KEYS = frozenset({
+    "CPU_RANGE", "JITTER_RANGE", "DELAY_RANGE",
+    "LAMBDA_RANGE", "IMS_SESSION_RANGE",
+})
+
+# Keys that callers are allowed to update via POST /api/config
+_UPDATABLE_KEYS = frozenset({
+    "MU", "PUSH_INTERVAL", "DATA_SOURCE", "CSV_PATH",
+    "CPU_RANGE", "JITTER_RANGE", "DELAY_RANGE",
+    "LAMBDA_RANGE", "IMS_SESSION_RANGE",
+    "W_DELAY", "W_JITTER", "W_CPU",
+    "SERVICE_WEIGHTS",
+    "SIMULATION_CHAOS", "SIMULATION_MOMENTUM",
+    "VOIP_JITTER_THRESHOLD", "VIDEO_DELAY_THRESHOLD",
+    "CPU_WARNING_THRESHOLD", "LAMBDA_WARNING_RATIO",
+    "ACTION_MODE", "FORCED_ACTION", "FORCED_STATUS",
+})
+
+# Action library (text is in Azerbaijani as in the original)
+ACTION_LIBRARY: dict = {
     "observe": {
-        "service": "Bütün xidmətlər",
+        "service":  "Bütün xidmətlər",
         "priority": "AŞAĞI",
-        "patch": "Yamaq tələb olunmur. Əsas nəqliyyat siyasətini aktiv saxlayın.",
+        "patch":    "Həll tələb olunmur. Əsas nəqliyyat siyasətini aktiv saxlayın.",
     },
     "rtp_priority_qos": {
-        "service": "VoIP",
+        "service":  "VoIP",
         "priority": "YÜKSƏK",
-        "patch": "cli: qos policy update class VOIP set dscp ef queue strict-priority",
+        "patch":    "cli: qos policy update class VOIP set dscp ef queue strict-priority",
     },
     "increase_bandwidth_reservation": {
-        "service": "Video",
+        "service":  "Video",
         "priority": "ORTA",
-        "patch": "config: ims.video.reservation=+15% and gpon.tcont.video.assured_bw=boost",
+        "patch":    "config: ims.video.reservation=+15% and gpon.tcont.video.assured_bw=boost",
     },
     "load_balance_secondary": {
-        "service": "Nəqliyyat",
+        "service":  "Nəqliyyat",
         "priority": "YÜKSƏK",
-        "patch": "cli: orchestrator rebalance --target secondary-vnf --drain best-effort 20%",
+        "patch":    "cli: orchestrator rebalance --target secondary-vnf --drain best-effort 20%",
     },
     "preemptive_shaping": {
-        "service": "Nəqliyyat",
-        "priority": "YÜKSƏK",
-        "patch": "cli: traffic-shaper apply profile preemptive_guard --window 30s",
+        "service":  "Nəqliyyat",
+        "priority": "YÜKSEK",
+        "patch":    "cli: traffic-shaper apply profile preemptive_guard --window 30s",
     },
 }
 
-UPDATABLE_CONFIG = {
-    "MU",
-    "PUSH_INTERVAL",
-    "DATA_SOURCE",
-    "CSV_PATH",
-    "CPU_RANGE",
-    "JITTER_RANGE",
-    "DELAY_RANGE",
-    "LAMBDA_RANGE",
-    "IMS_SESSION_RANGE",
-    "W_DELAY",
-    "W_JITTER",
-    "W_CPU",
-    "SERVICE_WEIGHTS",
-    "SIMULATION_CHAOS",
-    "SIMULATION_MOMENTUM",
-    "VOIP_JITTER_THRESHOLD",
-    "VIDEO_DELAY_THRESHOLD",
-    "CPU_WARNING_THRESHOLD",
-    "LAMBDA_WARNING_RATIO",
-    "ACTION_MODE",
-    "FORCED_ACTION",
-    "FORCED_STATUS",
-}
-
-RANGE_KEYS = {
-    "CPU_RANGE",
-    "JITTER_RANGE",
-    "DELAY_RANGE",
-    "LAMBDA_RANGE",
-    "IMS_SESSION_RANGE",
+# Warm-boot reference values — keeps the sim from starting in a degraded state
+_NORMAL_BOOTSTRAP = {
+    "cpu":      22.0,
+    "jitter":    6.0,
+    "delay":    12.0,
+    "lambda_":   3.2,
+    "ims_total": 24,
 }
 
 DB_PATH = "network_metrics.db"
 
-_csv_reader_state = {"rows": [], "index": 0}
-_push_thread = None
-_push_lock = Lock()
-_telemetry_window = deque(maxlen=120)
-_sim_state = None
-_decision_state = {
-    "last_action": None,
-    "last_result": "Hələ heç bir əməliyyat qiymətləndirilməyib.",
-}
-_emit_state = {
-    "last_snapshot": None,
-    "last_action_signature": None,
-}
+# ═══════════════════════════════════════════════════════════════════
+# 3.  Database helpers
+# ═══════════════════════════════════════════════════════════════════
 
-NORMAL_BOOTSTRAP = {
-    "cpu": 22.0,
-    "jitter": 6.0,
-    "delay": 12.0,
-    "lambda_": 3.2,
-    "ims_total": 24,
-}
-
-
-def init_db():
+def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS metrics (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts        TEXT    NOT NULL,
-                cpu       REAL    NOT NULL,
-                jitter    REAL    NOT NULL,
-                delay     REAL    NOT NULL,
-                lambda_   REAL    NOT NULL,
-                qos       REAL    NOT NULL,
-                wq        REAL    NOT NULL,
-                status    TEXT    NOT NULL
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts       TEXT NOT NULL,
+                cpu      REAL NOT NULL,
+                jitter   REAL NOT NULL,
+                delay    REAL NOT NULL,
+                lambda_  REAL NOT NULL,
+                qos      REAL NOT NULL,
+                wq       REAL NOT NULL,
+                status   TEXT NOT NULL
             )
-            """
-        )
+        """)
         conn.commit()
 
 
-def log_event(channel: str, message: str):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] [{channel}] {message}", flush=True)
-
-
-def insert_metric(snapshot: dict):
-    row = {
-        "ts": snapshot["ts"],
-        "cpu": snapshot["cpu"],
-        "jitter": snapshot["jitter"],
-        "delay": snapshot["delay"],
-        "lambda_": snapshot["lambda_"],
-        "qos": snapshot["qos"],
-        "wq": snapshot["wq"],
-        "status": snapshot["status"],
-    }
+def insert_metric(snapshot: dict) -> None:
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
+        conn.execute("""
             INSERT INTO metrics (ts, cpu, jitter, delay, lambda_, qos, wq, status)
             VALUES (:ts, :cpu, :jitter, :delay, :lambda_, :qos, :wq, :status)
-            """,
-            row,
-        )
+        """, {
+            "ts":      snapshot["ts"],
+            "cpu":     snapshot["cpu"],
+            "jitter":  snapshot["jitter"],
+            "delay":   snapshot["delay"],
+            "lambda_": snapshot["lambda_"],
+            "qos":     snapshot["qos"],
+            "wq":      snapshot["wq"],
+            "status":  snapshot["status"],
+        })
         conn.commit()
 
 
-def fetch_history(limit=60):
+def fetch_history(limit: int = 60) -> list:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT * FROM metrics ORDER BY id DESC LIMIT ?",
-            (limit,),
+            "SELECT * FROM metrics ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
-    return [dict(row) for row in reversed(rows)]
+    return [dict(r) for r in reversed(rows)]
 
 
-def fetch_latest_metric():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM metrics ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-    return dict(row) if row else None
-
-
-def action_signature(action_center: dict | None):
-    if not action_center:
-        return None
-    return (
-        action_center.get("scenario"),
-        action_center.get("status"),
-        action_center.get("priority"),
-        round(float(action_center.get("confidence_score", 0.0)), 2),
-        action_center.get("optimization_result"),
-    )
-
+# ═══════════════════════════════════════════════════════════════════
+# 4.  Math / QoS / M/M/1 models
+# ═══════════════════════════════════════════════════════════════════
 
 def calculate_qos(delay: float, jitter: float, cpu: float) -> float:
-    score = 100.0 - (
-        CONFIG["W_DELAY"] * delay
-        + CONFIG["W_JITTER"] * jitter
-        + CONFIG["W_CPU"] * cpu
+    """QoS = 100 - (W_d*delay + W_j*jitter + W_c*cpu), clamped [0, 100]."""
+    score = (
+        100.0
+        - CONFIG["W_DELAY"]  * delay
+        - CONFIG["W_JITTER"] * jitter
+        - CONFIG["W_CPU"]    * cpu
     )
     return round(max(0.0, min(100.0, score)), 2)
 
 
-def calculate_mm1_wait(lambda_: float, mu: float | None = None) -> float:
-    mu = CONFIG["MU"] if mu is None else mu
+def calculate_mm1_wait(lambda_: float, mu: float = None) -> float:
+    """W = 1 / (mu - lambda).  Returns inf when lambda >= mu."""
+    mu = mu if mu is not None else CONFIG["MU"]
     if lambda_ >= mu:
         return float("inf")
     return round(1.0 / (mu - lambda_), 4)
@@ -237,229 +257,254 @@ def classify_status(qos: float) -> str:
     return "Critical"
 
 
-def mm1_curve(mu: float | None = None, steps: int = 50):
-    mu = CONFIG["MU"] if mu is None else mu
+def mm1_curve(mu: float = None, steps: int = 50) -> list:
+    """Return (lambda, W) pairs from lambda=0 up to 0.99*mu for plotting."""
+    mu = mu if mu is not None else CONFIG["MU"]
     points = []
-    for idx in range(1, steps + 1):
-        lam = round(mu * (idx / (steps + 1)), 4)
+    for i in range(1, steps + 1):
+        lam  = round(mu * i / (steps + 1), 4)
         wait = calculate_mm1_wait(lam, mu)
-        points.append({"lambda": lam, "W": wait if wait != float("inf") else None})
+        points.append({"lambda": lam, "W": wait if math.isfinite(wait) else None})
     return points
 
 
-def clamp(value: float, bounds: tuple[float, float]) -> float:
+def severity_rank(status: str) -> int:
+    return {"Normal": 0, "Warning": 1, "Critical": 2}.get(status, 0)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 5.  Simulation engine
+# ═══════════════════════════════════════════════════════════════════
+
+_sim_state: dict = None
+
+
+def _clamp(value: float, bounds: tuple) -> float:
     return max(bounds[0], min(bounds[1], value))
 
 
-def normalize_weights(weights: dict) -> dict:
-    base = {
-        "voip": max(0.0, float(weights.get("voip", 0))),
-        "video": max(0.0, float(weights.get("video", 0))),
-        "web": max(0.0, float(weights.get("web", 0))),
-    }
-    total = sum(base.values()) or 1.0
-    return {key: value / total for key, value in base.items()}
-
-
-def split_sessions(total_sessions: int) -> dict:
-    weights = normalize_weights(CONFIG["SERVICE_WEIGHTS"])
-    voip = int(round(total_sessions * weights["voip"]))
-    video = int(round(total_sessions * weights["video"]))
-    web = max(0, total_sessions - voip - video)
-    return {"voip": voip, "video": video, "web": web}
-
-
-def _load_csv():
-    path = CONFIG["CSV_PATH"]
-    if not os.path.exists(path):
-        return False
-    with open(path, newline="") as csv_file:
-        reader = csv.DictReader(csv_file)
-        _csv_reader_state["rows"] = list(reader)
-    _csv_reader_state["index"] = 0
-    return bool(_csv_reader_state["rows"])
-
-
-def _next_csv_row():
-    rows = _csv_reader_state["rows"]
-    if not rows:
-        return None
-    idx = _csv_reader_state["index"] % len(rows)
-    _csv_reader_state["index"] += 1
-    row = rows[idx]
+def _init_sim_state() -> dict:
     return {
-        "cpu": float(row["cpu"]),
-        "jitter": float(row["jitter"]),
-        "delay": float(row["delay"]),
-        "lambda_": float(row["lambda"]),
-        "ims_total": int(float(row.get("ims_total", 0) or 0)),
+        **_NORMAL_BOOTSTRAP,
+        "lambda_velocity": 0.0,
+        "shock":           0.0,
+        "tick":            0,
+        "warmup":          8,
     }
 
 
-def parse_ts_epoch(ts_value: str) -> float:
-    try:
-        return datetime.fromisoformat(ts_value.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return time.time()
+def _seed_sim_from_history(history: list) -> dict:
+    """Blend the latest DB row toward the normal bootstrap so the
+    simulation always starts in a healthy-ish state."""
+    if not history:
+        return _init_sim_state()
+
+    latest = history[-1]
+    blended = {
+        "cpu":      latest["cpu"]      * 0.25 + _NORMAL_BOOTSTRAP["cpu"]      * 0.75,
+        "jitter":   latest["jitter"]   * 0.20 + _NORMAL_BOOTSTRAP["jitter"]   * 0.80,
+        "delay":    latest["delay"]    * 0.20 + _NORMAL_BOOTSTRAP["delay"]    * 0.80,
+        "lambda_":  latest["lambda_"]  * 0.35 + _NORMAL_BOOTSTRAP["lambda_"]  * 0.65,
+        "ims_total": int(round(
+            latest.get("ims_total", _NORMAL_BOOTSTRAP["ims_total"]) * 0.3
+            + _NORMAL_BOOTSTRAP["ims_total"] * 0.7
+        )),
+    }
+
+    # Force a clean start if the blended QoS is still degraded
+    if calculate_qos(blended["delay"], blended["jitter"], blended["cpu"]) < 82:
+        blended.update(cpu=min(blended["cpu"], 28.0),
+                       jitter=min(blended["jitter"], 8.0),
+                       delay=min(blended["delay"], 14.0))
+
+    return {
+        "cpu":             round(_clamp(blended["cpu"],     CONFIG["CPU_RANGE"]),     2),
+        "jitter":          round(_clamp(blended["jitter"],  CONFIG["JITTER_RANGE"]),  2),
+        "delay":           round(_clamp(blended["delay"],   CONFIG["DELAY_RANGE"]),   2),
+        "lambda_":         round(_clamp(blended["lambda_"], CONFIG["LAMBDA_RANGE"]),  2),
+        "ims_total":       int(_clamp(blended["ims_total"], CONFIG["IMS_SESSION_RANGE"])),
+        "lambda_velocity": 0.0,
+        "shock":           0.0,
+        "tick":            0,
+        "warmup":          8,
+    }
 
 
-def seed_runtime_state():
+def seed_runtime_state() -> None:
+    """Call once at startup to warm the sim from DB history."""
     global _sim_state
-
     history = fetch_history(12)
+
     for row in history:
-        _telemetry_window.append({
-            "ts_epoch": parse_ts_epoch(row["ts"]),
-            "cpu": float(row["cpu"]),
-            "jitter": float(row["jitter"]),
-            "delay": float(row["delay"]),
-            "lambda_": float(row["lambda_"]),
+        _add_telemetry_sample({
+            "ts_epoch": _parse_ts_epoch(row["ts"]),
+            "cpu":      float(row["cpu"]),
+            "jitter":   float(row["jitter"]),
+            "delay":    float(row["delay"]),
+            "lambda_":  float(row["lambda_"]),
         })
 
-    latest = history[-1] if history else None
-    if latest is None:
-        _sim_state = {
-            **NORMAL_BOOTSTRAP,
-            "lambda_velocity": 0.0,
-            "shock": 0.0,
-            "tick": 0,
-            "warmup": 8,
-        }
-        return
-
-    blended = {
-        "cpu": latest["cpu"] * 0.25 + NORMAL_BOOTSTRAP["cpu"] * 0.75,
-        "jitter": latest["jitter"] * 0.20 + NORMAL_BOOTSTRAP["jitter"] * 0.80,
-        "delay": latest["delay"] * 0.20 + NORMAL_BOOTSTRAP["delay"] * 0.80,
-        "lambda_": latest["lambda_"] * 0.35 + NORMAL_BOOTSTRAP["lambda_"] * 0.65,
-        "ims_total": int(round(latest.get("ims_total", NORMAL_BOOTSTRAP["ims_total"]) * 0.3 + NORMAL_BOOTSTRAP["ims_total"] * 0.7)),
-    }
-
-    bootstrap_qos = calculate_qos(blended["delay"], blended["jitter"], blended["cpu"])
-    if bootstrap_qos < 82:
-        blended["cpu"] = min(blended["cpu"], 28.0)
-        blended["jitter"] = min(blended["jitter"], 8.0)
-        blended["delay"] = min(blended["delay"], 14.0)
-
-    _sim_state = {
-        "cpu": round(clamp(blended["cpu"], CONFIG["CPU_RANGE"]), 2),
-        "jitter": round(clamp(blended["jitter"], CONFIG["JITTER_RANGE"]), 2),
-        "delay": round(clamp(blended["delay"], CONFIG["DELAY_RANGE"]), 2),
-        "lambda_": round(clamp(blended["lambda_"], CONFIG["LAMBDA_RANGE"]), 2),
-        "ims_total": int(clamp(blended["ims_total"], CONFIG["IMS_SESSION_RANGE"])),
-        "lambda_velocity": 0.0,
-        "shock": 0.0,
-        "tick": 0,
-        "warmup": 8,
-    }
-    log_event(
-        "startup",
-        f"seeded simulation cpu={_sim_state['cpu']:.1f} jitter={_sim_state['jitter']:.1f} "
-        f"delay={_sim_state['delay']:.1f} lambda={_sim_state['lambda_']:.2f}"
-    )
-
-
-def init_sim_state():
-    midpoint = lambda bounds: (bounds[0] + bounds[1]) / 2.0
-    return {
-        "cpu": NORMAL_BOOTSTRAP["cpu"],
-        "jitter": NORMAL_BOOTSTRAP["jitter"],
-        "delay": NORMAL_BOOTSTRAP["delay"],
-        "lambda_": NORMAL_BOOTSTRAP["lambda_"],
-        "ims_total": NORMAL_BOOTSTRAP["ims_total"],
-        "lambda_velocity": 0.0,
-        "shock": 0.0,
-        "tick": 0,
-        "warmup": 8,
-    }
+    _sim_state = _seed_sim_from_history(history)
+    _log("startup",
+         f"sim seeded: cpu={_sim_state['cpu']:.1f} jitter={_sim_state['jitter']:.1f} "
+         f"delay={_sim_state['delay']:.1f} lambda={_sim_state['lambda_']:.2f}")
 
 
 def simulate_metrics() -> dict:
+    """Advance the simulation by one tick and return raw metric values.
+
+    Physics summary
+    ---------------
+    - lambda follows a mean-reverting random walk driven by a momentum term.
+    - Random shocks inject occasional bursts (probability scales with CHAOS).
+    - CPU, jitter, and delay are each modelled as exponential smoothing
+      toward a target that is a function of lambda and the shock.
+    - MOMENTUM controls how much the previous velocity carries forward
+      (higher = smoother but slower to respond).
+    - CHAOS scales shock magnitude and noise amplitude
+      (0 = smooth/realistic, 1.5 = erratic/stress-test).
+    - A warmup period damps everything to healthy values on first boot.
+    """
     global _sim_state
     if _sim_state is None:
-        _sim_state = init_sim_state()
+        _sim_state = _init_sim_state()
 
-    chaos = max(0.0, min(1.5, float(CONFIG["SIMULATION_CHAOS"])))
+    # Read config (validate to safe ranges)
+    chaos    = max(0.0, min(1.5,  float(CONFIG["SIMULATION_CHAOS"])))
     momentum = max(0.0, min(0.97, float(CONFIG["SIMULATION_MOMENTUM"])))
+    mu       = max(0.001, float(CONFIG["MU"]))
 
-    state = _sim_state
-    state["tick"] += 1
+    state  = _sim_state
     warmup = max(0, int(state.get("warmup", 0)))
+    state["tick"] += 1
 
+    # Shocks: probability of a new shock rises with chaos.
+    # Shock decays between ticks so it doesn't permanently offset the sim.
     if random.random() < 0.08 + chaos * 0.08:
         state["shock"] = random.uniform(-1.0, 1.0) * (0.18 + chaos * 0.95)
     else:
         state["shock"] *= 0.72
 
+    # Damp everything during warmup
+    effective_chaos = chaos * (0.35 if warmup > 0 else 1.0)
     if warmup > 0:
-        chaos *= 0.35
         state["shock"] *= 0.35
 
+    # lambda random walk with mean-reversion
     lambda_center = (CONFIG["LAMBDA_RANGE"][0] + CONFIG["LAMBDA_RANGE"][1]) / 2.0
-    lambda_drift = (lambda_center - state["lambda_"]) * 0.08
-    lambda_noise = random.uniform(-0.28, 0.28) * (0.25 + chaos)
+    lambda_drift  = (lambda_center - state["lambda_"]) * 0.08
+    lambda_noise  = random.uniform(-0.28, 0.28) * (0.25 + effective_chaos)
+
     state["lambda_velocity"] = (
         state["lambda_velocity"] * momentum
-        + lambda_drift * 0.4
+        + lambda_drift  * 0.4
         + lambda_noise
         + state["shock"] * 0.22
     )
-    state["lambda_"] = clamp(
+    state["lambda_"] = _clamp(
         state["lambda_"] + state["lambda_velocity"],
         CONFIG["LAMBDA_RANGE"],
     )
 
-    lambda_ratio = state["lambda_"] / max(CONFIG["MU"], 0.001)
-    base_sessions = (
-        CONFIG["IMS_SESSION_RANGE"][0]
-        + (CONFIG["IMS_SESSION_RANGE"][1] - CONFIG["IMS_SESSION_RANGE"][0]) * min(1.0, lambda_ratio)
-    )
-    session_noise = random.uniform(-2.5, 2.5) * (0.5 + chaos)
-    state["ims_total"] = int(round(clamp(
+    # IMS sessions track lambda with lag
+    lambda_ratio  = state["lambda_"] / mu
+    session_range = CONFIG["IMS_SESSION_RANGE"]
+    base_sessions = session_range[0] + (session_range[1] - session_range[0]) * min(1.0, lambda_ratio)
+    session_noise = random.uniform(-2.5, 2.5) * (0.5 + effective_chaos)
+    state["ims_total"] = int(round(_clamp(
         state["ims_total"] * 0.55 + base_sessions * 0.45 + session_noise,
-        CONFIG["IMS_SESSION_RANGE"],
+        session_range,
     )))
 
-    cpu_target = 16 + lambda_ratio * 58 + state["ims_total"] * 0.12 + abs(state["shock"]) * 16
-    cpu_noise = random.uniform(-2.2, 2.2) * (0.55 + chaos)
-    state["cpu"] = clamp(
+    # CPU is a function of lambda-ratio, sessions, and shock
+    cpu_target = (
+        16.0
+        + lambda_ratio       * 58.0
+        + state["ims_total"] * 0.12
+        + abs(state["shock"]) * 16.0
+    )
+    cpu_noise = random.uniform(-2.2, 2.2) * (0.55 + effective_chaos)
+    state["cpu"] = _clamp(
         state["cpu"] * 0.72 + cpu_target * 0.28 + cpu_noise,
         CONFIG["CPU_RANGE"],
     )
 
-    jitter_target = 4 + lambda_ratio * 10 + max(0.0, state["cpu"] - 55) * 0.12 + abs(state["shock"]) * 7
-    jitter_noise = random.uniform(-1.3, 1.3) * (0.45 + chaos)
-    state["jitter"] = clamp(
+    # Jitter rises with lambda-ratio and high CPU
+    jitter_target = (
+        4.0
+        + lambda_ratio * 10.0
+        + max(0.0, state["cpu"] - 55.0) * 0.12
+        + abs(state["shock"]) * 7.0
+    )
+    jitter_noise = random.uniform(-1.3, 1.3) * (0.45 + effective_chaos)
+    state["jitter"] = _clamp(
         state["jitter"] * 0.62 + jitter_target * 0.38 + jitter_noise,
         CONFIG["JITTER_RANGE"],
     )
 
-    delay_target = 8 + lambda_ratio * 18 + state["jitter"] * 0.85 + max(0.0, state["cpu"] - 60) * 0.16
-    delay_noise = random.uniform(-1.8, 1.8) * (0.45 + chaos)
-    state["delay"] = clamp(
+    # Delay is correlated with jitter and CPU
+    delay_target = (
+        8.0
+        + lambda_ratio    * 18.0
+        + state["jitter"] * 0.85
+        + max(0.0, state["cpu"] - 60.0) * 0.16
+    )
+    delay_noise = random.uniform(-1.8, 1.8) * (0.45 + effective_chaos)
+    state["delay"] = _clamp(
         state["delay"] * 0.66 + delay_target * 0.34 + delay_noise,
         CONFIG["DELAY_RANGE"],
     )
 
+    # Warmup caps: keep values in healthy territory for first N ticks
     if warmup > 0:
         state["lambda_"] = min(state["lambda_"], 4.2)
-        state["cpu"] = min(state["cpu"], 31.0)
-        state["jitter"] = min(state["jitter"], 8.5)
-        state["delay"] = min(state["delay"], 16.0)
-        state["warmup"] = warmup - 1
+        state["cpu"]     = min(state["cpu"],     31.0)
+        state["jitter"]  = min(state["jitter"],   8.5)
+        state["delay"]   = min(state["delay"],   16.0)
+        state["warmup"]  = warmup - 1
 
     return {
-        "cpu": round(state["cpu"], 2),
-        "jitter": round(state["jitter"], 2),
-        "delay": round(state["delay"], 2),
-        "lambda_": round(state["lambda_"], 2),
+        "cpu":       round(state["cpu"],     2),
+        "jitter":    round(state["jitter"],  2),
+        "delay":     round(state["delay"],   2),
+        "lambda_":   round(state["lambda_"], 2),
         "ims_total": int(state["ims_total"]),
+    }
+
+
+# CSV data source helpers
+
+_csv_state: dict = {"rows": [], "index": 0}
+
+
+def _load_csv() -> bool:
+    path = CONFIG["CSV_PATH"]
+    if not os.path.exists(path):
+        return False
+    with open(path, newline="") as f:
+        _csv_state["rows"] = list(csv.DictReader(f))
+    _csv_state["index"] = 0
+    return bool(_csv_state["rows"])
+
+
+def _next_csv_row() -> dict:
+    rows = _csv_state["rows"]
+    if not rows:
+        return None
+    row = rows[_csv_state["index"] % len(rows)]
+    _csv_state["index"] += 1
+    return {
+        "cpu":       float(row["cpu"]),
+        "jitter":    float(row["jitter"]),
+        "delay":     float(row["delay"]),
+        "lambda_":   float(row["lambda"]),
+        "ims_total": int(float(row.get("ims_total", 0) or 0)),
     }
 
 
 def get_raw_metrics() -> dict:
     if CONFIG["DATA_SOURCE"] == "csv":
-        if not _csv_reader_state["rows"]:
+        if not _csv_state["rows"]:
             _load_csv()
         row = _next_csv_row()
         if row:
@@ -467,422 +512,531 @@ def get_raw_metrics() -> dict:
     return simulate_metrics()
 
 
-def add_window_sample(sample: dict):
+# ═══════════════════════════════════════════════════════════════════
+# 6.  Telemetry window & gradient analytics
+# ═══════════════════════════════════════════════════════════════════
+
+# Rolling window of the last 120 samples for gradient computation
+_telemetry_window: deque = deque(maxlen=120)
+
+
+def _parse_ts_epoch(ts: str) -> float:
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return time.time()
+
+
+def _add_telemetry_sample(sample: dict) -> None:
     _telemetry_window.append(sample)
 
 
-def interpolate_metric(seconds_ago: float, key: str, current_ts: float, current_value: float) -> float:
+def _interpolate_past(key: str, seconds_ago: float, current_ts: float, fallback: float) -> float:
+    """Return the value of `key` from ~seconds_ago seconds in the past."""
     target_ts = current_ts - seconds_ago
-    if not _telemetry_window:
-        return current_value
-
-    previous = None
     for point in reversed(_telemetry_window):
         if point["ts_epoch"] <= target_ts:
             return float(point[key])
-        previous = point
-
-    return float(_telemetry_window[0][key]) if previous is not None else current_value
+    return float(_telemetry_window[0][key]) if _telemetry_window else fallback
 
 
-def compute_gradients(raw: dict, current_ts: float) -> dict:
-    window_seconds = 10.0
-    gradients = {}
-    for key in ("jitter", "delay", "cpu", "lambda_"):
-        past_value = interpolate_metric(window_seconds, key, current_ts, float(raw[key]))
-        gradients[key] = round((float(raw[key]) - past_value) / window_seconds, 4)
-    return gradients
+def compute_gradients(raw: dict, now: float) -> dict:
+    """Rate of change (units/s) over the last 10 s for each key metric."""
+    window = 10.0
+    return {
+        key: round(
+            (float(raw[key]) - _interpolate_past(key, window, now, float(raw[key]))) / window,
+            4,
+        )
+        for key in ("jitter", "delay", "cpu", "lambda_")
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 7.  Service-health & queue-projection helpers
+# ═══════════════════════════════════════════════════════════════════
+
+def _normalise_weights(w: dict) -> dict:
+    """Normalise service-weight dict so values sum to 1."""
+    values = {k: max(0.0, float(w.get(k, 0))) for k in ("voip", "video", "web")}
+    total  = sum(values.values()) or 1.0
+    return {k: v / total for k, v in values.items()}
+
+
+def split_sessions(total: int) -> dict:
+    weights = _normalise_weights(CONFIG["SERVICE_WEIGHTS"])
+    voip  = int(round(total * weights["voip"]))
+    video = int(round(total * weights["video"]))
+    web   = max(0, total - voip - video)
+    return {"voip": voip, "video": video, "web": web}
 
 
 def compute_service_health(raw: dict) -> dict:
-    shi_voip = max(0.0, min(100.0, 100 - (raw["jitter"] * 2.5 + raw["delay"] * 0.5)))
-    shi_video = max(0.0, min(100.0, 100 - (raw["delay"] * 1.5 + raw["cpu"] * 0.2)))
+    """Service Health Index (SHI) in [0, 100] per service type."""
+    shi_voip  = max(0.0, min(100.0, 100.0 - (raw["jitter"] * 2.5 + raw["delay"] * 0.5)))
+    shi_video = max(0.0, min(100.0, 100.0 - (raw["delay"]  * 1.5 + raw["cpu"]   * 0.2)))
     return {"voip": round(shi_voip, 2), "video": round(shi_video, 2)}
 
 
 def projected_queue_metrics(raw: dict, gradients: dict) -> dict:
-    projected_lambda = max(0.01, raw["lambda_"] + gradients["lambda_"] * 30.0)
-    projected_wait = calculate_mm1_wait(projected_lambda)
+    """Project lambda and Wq 30 s into the future using current gradient."""
+    proj_lambda = max(0.01, raw["lambda_"] + gradients["lambda_"] * 30.0)
+    proj_wq     = calculate_mm1_wait(proj_lambda)
+
     if gradients["lambda_"] > 0 and raw["lambda_"] < CONFIG["MU"]:
-        time_to_saturation = max(0.0, (CONFIG["MU"] - raw["lambda_"]) / gradients["lambda_"])
+        time_to_sat = max(0.0, (CONFIG["MU"] - raw["lambda_"]) / gradients["lambda_"])
     else:
-        time_to_saturation = float("inf")
+        time_to_sat = float("inf")
 
     return {
-        "projected_lambda_30s": round(projected_lambda, 3),
-        "projected_wq_30s": projected_wait,
-        "projected_wq_30s_ms": round(projected_wait * 1000, 2) if math.isfinite(projected_wait) else float("inf"),
-        "time_to_saturation_s": round(time_to_saturation, 2) if math.isfinite(time_to_saturation) else float("inf"),
+        "projected_lambda_30s":  round(proj_lambda, 3),
+        "projected_wq_30s":      proj_wq,
+        "projected_wq_30s_ms":   round(proj_wq * 1000, 2) if math.isfinite(proj_wq) else float("inf"),
+        "time_to_saturation_s":  round(time_to_sat, 2)    if math.isfinite(time_to_sat) else float("inf"),
     }
 
 
-def severity_rank(status: str) -> int:
-    return {"Normal": 0, "Warning": 1, "Critical": 2}.get(status, 0)
+# ═══════════════════════════════════════════════════════════════════
+# 8.  Decision / action-center engine
+# ═══════════════════════════════════════════════════════════════════
+
+_decision_state: dict = {
+    "last_action": None,
+    "last_result": "Hələ heç bir əməliyyat qiymətləndirilməyib.",
+}
 
 
-def action_status_from_score(score: float) -> str:
+def _action_status_from_score(score: float) -> str:
     if score >= 2.25:
         return "Critical"
-    if score >= 0.9:
+    if score >= 0.90:
         return "Warning"
     return "Normal"
 
 
-def build_candidate_scores(raw: dict, sessions: dict, gradients: dict, shi: dict, queue_projection: dict) -> dict:
+def _build_candidate_scores(raw: dict, sessions: dict, gradients: dict,
+                             shi: dict, queue_proj: dict) -> dict:
     lambda_ratio = raw["lambda_"] / max(CONFIG["MU"], 0.001)
-    scores = {"observe": 0.15}
+    total        = max(sessions["voip"] + sessions["video"] + sessions["web"], 1)
+    scores       = {"observe": 0.15}
 
-    voip_score = 0.0
+    # VoIP / RTP priority
     if sessions["voip"] > 0:
-        load_factor = sessions["voip"] / max(sessions["voip"] + sessions["video"] + sessions["web"], 1)
-        voip_score = (
+        voip_load = sessions["voip"] / total
+        scores["rtp_priority_qos"] = round(
             max(0.0, gradients["jitter"])
             + max(0.0, (CONFIG["VOIP_JITTER_THRESHOLD"] - shi["voip"]) / 12.0)
             + max(0.0, (raw["jitter"] - CONFIG["VOIP_JITTER_THRESHOLD"]) / 6.0)
-            + load_factor * 1.2
+            + voip_load * 1.2,
+            4,
         )
-    scores["rtp_priority_qos"] = round(voip_score, 4)
+    else:
+        scores["rtp_priority_qos"] = 0.0
 
-    video_score = 0.0
+    # Video / bandwidth reservation
     if sessions["video"] > 0:
-        load_factor = sessions["video"] / max(sessions["voip"] + sessions["video"] + sessions["web"], 1)
-        video_score = (
+        video_load = sessions["video"] / total
+        scores["increase_bandwidth_reservation"] = round(
             max(0.0, gradients["delay"])
             + max(0.0, (CONFIG["VIDEO_DELAY_THRESHOLD"] - shi["video"]) / 16.0)
             + max(0.0, (raw["delay"] - CONFIG["VIDEO_DELAY_THRESHOLD"]) / 9.0)
             + max(0.0, (raw["cpu"] - 70.0) / 18.0)
-            + load_factor
+            + video_load,
+            4,
         )
-    scores["increase_bandwidth_reservation"] = round(video_score, 4)
+    else:
+        scores["increase_bandwidth_reservation"] = 0.0
 
-    transport_score = (
+    # Transport load-balance
+    scores["load_balance_secondary"] = round(
         max(0.0, lambda_ratio - CONFIG["LAMBDA_WARNING_RATIO"]) * 5.5
         + max(0.0, gradients["lambda_"]) * 1.3
         + max(0.0, (raw["cpu"] - CONFIG["CPU_WARNING_THRESHOLD"]) / 6.0)
-        + (2.2 if queue_projection["time_to_saturation_s"] <= 30 else 0.0)
+        + (2.2 if queue_proj["time_to_saturation_s"] <= 30 else 0.0),
+        4,
     )
-    scores["load_balance_secondary"] = round(transport_score, 4)
 
-    preemptive_score = (
+    # Pre-emptive shaping
+    scores["preemptive_shaping"] = round(
         max(0.0, gradients["lambda_"]) * 1.5
         + max(0.0, gradients["delay"]) * 0.8
-        + (3.0 if queue_projection["projected_wq_30s_ms"] > 200 else 0.0)
-        + (1.5 if queue_projection["time_to_saturation_s"] <= 30 else 0.0)
+        + (3.0 if queue_proj["projected_wq_30s_ms"] > 200 else 0.0)
+        + (1.5 if queue_proj["time_to_saturation_s"] <= 30 else 0.0),
+        4,
     )
-    scores["preemptive_shaping"] = round(preemptive_score, 4)
+
     return scores
 
 
-def build_decision_object(
-    action_key: str,
-    status: str,
-    mode: str,
-    raw: dict,
-    sessions: dict,
-    gradients: dict,
-    shi: dict,
-    queue_projection: dict,
-    confidence: float,
-    optimization_result: str,
-) -> dict:
-    template = ACTION_LIBRARY[action_key]
-    voip_load = sessions["voip"]
-    video_load = sessions["video"]
-    total_sessions = sessions["voip"] + sessions["video"] + sessions["web"]
-    lambda_ratio = raw["lambda_"] / max(CONFIG["MU"], 0.001)
-
-    if action_key == "rtp_priority_qos":
-        diagnosis = "Aktiv səs yükü zamanı IMS VoIP sessiyalarında artan jitter problemi müşahidə olunur."
-    elif action_key == "increase_bandwidth_reservation":
-        diagnosis = "CPU yüklənməsi və gecikmə artımı səbəbindən IMS video sessiyalarının keyfiyyəti zəifləyir."
-    elif action_key == "load_balance_secondary":
-        diagnosis = "Trafik intensivliyi xidmət tutumuna yaxınlaşdığı üçün nəqliyyat yükü artır."
-    elif action_key == "preemptive_shaping":
-        diagnosis = "Növbə artımı kritik limitlərə çatmadan əvvəl doyma vəziyyətinə yaxınlaşır."
-    else:
-        diagnosis = "Cari telemetriya intervalında dominant xidmət problemi müşahidə olunmur."
-
-    rationale_sentences = [
-        f"Son 10 saniyə ərzində jitter saniyədə {gradients['jitter']:.2f} ms, gecikmə {gradients['delay']:.2f} ms və CPU istifadəsi {gradients['cpu']:.2f}% dəyişib.",
-        f"VoIP Xidmət Sağlamlıq İndeksi {shi['voip']:.1f}, Video Xidmət Sağlamlıq İndeksi isə {shi['video']:.1f}-dir.",
-        f"Trafik intensivliyi lambda/mu = {lambda_ratio:.2f} səviyyəsində işləyir.",
-    ]
-
-    if math.isfinite(queue_projection["projected_wq_30s_ms"]):
-        rationale_sentences.append(
-            f"30 saniyə sonra proqnozlaşdırılan növbə gözləmə müddəti {queue_projection['projected_wq_30s_ms']:.1f} ms-dir."
-        )
-
-    if math.isfinite(queue_projection["time_to_saturation_s"]):
-        rationale_sentences.append(
-            f"Cari trendə əsasən doyma vəziyyətinə çatma müddəti təxminən {queue_projection['time_to_saturation_s']:.1f} saniyədir."
-        )
-
-    return {
-        "mode": mode,
-        "scenario": action_key,
-        "status": status,
-        "service": template["service"],
-        "priority": template["priority"],
-        "diagnosis": diagnosis,
-        "rationale": " ".join(rationale_sentences),
-        "proposed_patch": template["patch"],
-        "confidence_score": round(confidence, 2),
-        "optimization_result": optimization_result,
-        "analysis": f"Ümumi IMS sessiyaları={total_sessions}, VoIP={voip_load}, Video={video_load}.",
-        "decision": diagnosis,
-        "optimization": template["patch"],
-    }
+def _apply_hysteresis(candidate_key: str, candidate_status: str) -> tuple:
+    """Suppress action flapping: hold the current action for 15 s unless
+    a Critical event overrides it."""
+    last = _decision_state["last_action"]
+    if not last or (time.time() - last["applied_at"]) > 15:
+        return candidate_key, candidate_status
+    if candidate_key == last["scenario"]:
+        return candidate_key, candidate_status
+    if severity_rank(candidate_status) >= severity_rank("Critical"):
+        return candidate_key, candidate_status
+    return last["scenario"], last["status"]
 
 
-def assess_closed_loop(action_key: str, raw: dict, gradients: dict, shi: dict, queue_projection: dict) -> str:
-    last_action = _decision_state["last_action"]
-
-    if not last_action or last_action["scenario"] != action_key:
+def _assess_closed_loop(action_key: str, raw: dict, shi: dict, queue_proj: dict) -> str:
+    """Compare current telemetry against the baseline recorded when the
+    action was applied; return a human-readable outcome string."""
+    last = _decision_state["last_action"]
+    if not last or last["scenario"] != action_key:
         return _decision_state["last_result"]
 
-    elapsed = time.time() - last_action["applied_at"]
-
+    elapsed = time.time() - last["applied_at"]
     if elapsed < 6:
         return "Əməliyyat tətbiq edildi; dəyişiklikdən sonrakı telemetriya gözlənilir."
 
-    baseline = last_action["baseline"]
+    baseline = last["baseline"]
     improved = 0
-    checks = 0
+    checks   = 2
 
     if action_key == "rtp_priority_qos":
-        checks += 2
-        improved += raw["jitter"] <= baseline["jitter"]
-        improved += shi["voip"] >= baseline["shi_voip"]
-
+        improved += int(raw["jitter"] <= baseline["jitter"])
+        improved += int(shi["voip"]   >= baseline["shi_voip"])
     elif action_key == "increase_bandwidth_reservation":
-        checks += 2
-        improved += raw["delay"] <= baseline["delay"]
-        improved += shi["video"] >= baseline["shi_video"]
-
+        improved += int(raw["delay"]  <= baseline["delay"])
+        improved += int(shi["video"]  >= baseline["shi_video"])
     else:
-        checks += 2
-        improved += raw["lambda_"] <= baseline["lambda_"]
-        improved += (
-            queue_projection["projected_wq_30s_ms"]
-            <= baseline["projected_wq_30s_ms"]
-        )
+        improved += int(raw["lambda_"] <= baseline["lambda_"])
+        improved += int(queue_proj["projected_wq_30s_ms"] <= baseline["projected_wq_30s_ms"])
 
     result = (
         "Optimizasiya uğurla tamamlandı"
         if improved >= max(1, checks - 1)
         else "Əməliyyat təsirsiz oldu; eskalasiya edilir."
     )
-
     _decision_state["last_result"] = result
     return result
 
 
-def apply_hysteresis(candidate_key: str, candidate_status: str) -> tuple[str, str]:
-    last_action = _decision_state["last_action"]
-    if not last_action:
-        return candidate_key, candidate_status
+def _build_decision_object(action_key: str, status: str, mode: str,
+                            raw: dict, sessions: dict, gradients: dict,
+                            shi: dict, queue_proj: dict,
+                            confidence: float, opt_result: str) -> dict:
+    tmpl  = ACTION_LIBRARY[action_key]
+    total = sessions["voip"] + sessions["video"] + sessions["web"]
+    lambda_ratio = raw["lambda_"] / max(CONFIG["MU"], 0.001)
 
-    elapsed = time.time() - last_action["applied_at"]
-    if elapsed > 15:
-        return candidate_key, candidate_status
+    diagnoses = {
+        "rtp_priority_qos":               "Aktiv səs yükü zamanı IMS VoIP sessiyalarında artan jitter problemi müşahidə olunur.",
+        "increase_bandwidth_reservation": "CPU yüklənməsi ve gecikmə artımı səbəbindən IMS video sessiyalarının keyfiyyəti zəifləyir.",
+        "load_balance_secondary":         "Trafik intensivliyi xidmət tutumuna yaxınlaşdığı üçün nəqliyyat yükü artır.",
+        "preemptive_shaping":             "Növbə artımı kritik limitlərə çatmadan əvvəl doyma vəziyyətinə yaxınlaşır.",
+        "observe":                        "Cari telemetriya intervalında dominant xidmət problemi müşahidə olunmur.",
+    }
+    diagnosis = diagnoses.get(action_key, diagnoses["observe"])
 
-    if candidate_key == last_action["scenario"]:
-        return candidate_key, candidate_status
-
-    if severity_rank(candidate_status) < severity_rank("Critical"):
-        return last_action["scenario"], last_action["status"]
-
-    return candidate_key, candidate_status
-
-
-def resolve_action(raw: dict, sessions: dict, gradients: dict, shi: dict, queue_projection: dict, current_status: str) -> dict:
-    mode = CONFIG["ACTION_MODE"]
-    optimization_result = _decision_state["last_result"]
-
-    if mode == "manual":
-        action_key = CONFIG["FORCED_ACTION"]
-        status = CONFIG["FORCED_STATUS"]
-        return build_decision_object(
-            action_key,
-            status,
-            "manual",
-            raw,
-            sessions,
-            gradients,
-            shi,
-            queue_projection,
-            confidence=0.95,
-            optimization_result=optimization_result,
+    rationale_parts = [
+        f"Son 10 s ərzində jitter {gradients['jitter']:.2f} ms/s, "
+        f"gecikmə {gradients['delay']:.2f} ms/s, CPU {gradients['cpu']:.2f} %/s dəyişib.",
+        f"VoIP SHI={shi['voip']:.1f}, Video SHI={shi['video']:.1f}.",
+        f"lambda/mu = {lambda_ratio:.2f}.",
+    ]
+    if math.isfinite(queue_proj["projected_wq_30s_ms"]):
+        rationale_parts.append(
+            f"30 s sonrakı proqnoz Wq = {queue_proj['projected_wq_30s_ms']:.1f} ms."
+        )
+    if math.isfinite(queue_proj["time_to_saturation_s"]):
+        rationale_parts.append(
+            f"Doyma vəziyyəti ~{queue_proj['time_to_saturation_s']:.1f} s içindədir."
         )
 
-    scores = build_candidate_scores(raw, sessions, gradients, shi, queue_projection)
-    action_key, top_score = max(scores.items(), key=lambda item: item[1])
+    return {
+        "mode":                action_key,
+        "scenario":            action_key,
+        "status":              status,
+        "service":             tmpl["service"],
+        "priority":            tmpl["priority"],
+        "diagnosis":           diagnosis,
+        "rationale":           " ".join(rationale_parts),
+        "proposed_patch":      tmpl["patch"],
+        "confidence_score":    round(confidence, 2),
+        "optimization_result": opt_result,
+        "analysis":            f"IMS sessiyaları cəmi={total}, VoIP={sessions['voip']}, Video={sessions['video']}.",
+        "decision":            diagnosis,
+        "optimization":        tmpl["patch"],
+    }
+
+
+def resolve_action(raw: dict, sessions: dict, gradients: dict,
+                   shi: dict, queue_proj: dict, current_status: str) -> dict:
+    """Top-level decision resolver. Returns a full decision object."""
+    mode       = CONFIG["ACTION_MODE"]
+    opt_result = _decision_state["last_result"]
+
+    # Manual override
+    if mode == "manual":
+        return _build_decision_object(
+            CONFIG["FORCED_ACTION"], CONFIG["FORCED_STATUS"],
+            "manual", raw, sessions, gradients, shi, queue_proj,
+            confidence=0.95, opt_result=opt_result,
+        )
+
+    # Automatic scoring
+    scores     = _build_candidate_scores(raw, sessions, gradients, shi, queue_proj)
+    action_key, top_score = max(scores.items(), key=lambda kv: kv[1])
+
+    # Ignore low-confidence non-observe picks
     if action_key != "observe" and top_score < 0.75:
-        action_key = "observe"
-        top_score = scores["observe"]
+        action_key, top_score = "observe", scores["observe"]
+
     confidence = min(0.99, 0.35 + top_score / 5.0)
-    status = action_status_from_score(top_score)
+    status     = _action_status_from_score(top_score)
 
     if action_key == "observe":
-        status = current_status if current_status != "Normal" and top_score > 0.5 else "Normal"
+        status = current_status if (current_status != "Normal" and top_score > 0.5) else "Normal"
 
-    action_key, status = apply_hysteresis(action_key, status)
-    optimization_result = assess_closed_loop(action_key, raw, gradients, shi, queue_projection)
+    action_key, status = _apply_hysteresis(action_key, status)
+    opt_result = _assess_closed_loop(action_key, raw, shi, queue_proj)
 
-    decision = build_decision_object(
-        action_key,
-        status,
-        "auto",
-        raw,
-        sessions,
-        gradients,
-        shi,
-        queue_projection,
-        confidence=confidence,
-        optimization_result=optimization_result,
+    decision = _build_decision_object(
+        action_key, status, "auto",
+        raw, sessions, gradients, shi, queue_proj,
+        confidence=confidence, opt_result=opt_result,
     )
 
+    # Record baseline for closed-loop assessment
     if action_key != "observe":
-        last_action = _decision_state["last_action"]
-        if last_action is None or last_action["scenario"] != action_key:
+        last = _decision_state["last_action"]
+        if last is None or last["scenario"] != action_key:
             _decision_state["last_action"] = {
-                "scenario": action_key,
-                "status": status,
+                "scenario":   action_key,
+                "status":     status,
                 "applied_at": time.time(),
                 "baseline": {
-                    "jitter": raw["jitter"],
-                    "delay": raw["delay"],
-                    "lambda_": raw["lambda_"],
-                    "shi_voip": shi["voip"],
-                    "shi_video": shi["video"],
-                    "projected_wq_30s_ms": queue_projection["projected_wq_30s_ms"],
+                    "jitter":              raw["jitter"],
+                    "delay":               raw["delay"],
+                    "lambda_":             raw["lambda_"],
+                    "shi_voip":            shi["voip"],
+                    "shi_video":           shi["video"],
+                    "projected_wq_30s_ms": queue_proj["projected_wq_30s_ms"],
                 },
             }
         else:
-            last_action["status"] = status
+            last["status"] = status
 
     return decision
 
 
-def build_snapshot() -> dict:
-    raw = get_raw_metrics()
-    now_epoch = time.time()
-    ims_total = int(raw.get("ims_total") or random.randint(*CONFIG["IMS_SESSION_RANGE"]))
-    sessions = split_sessions(ims_total)
+# ═══════════════════════════════════════════════════════════════════
+# 9.  Snapshot assembly
+# ═══════════════════════════════════════════════════════════════════
 
-    add_window_sample({
+def build_snapshot() -> dict:
+    raw       = get_raw_metrics()
+    now_epoch = time.time()
+
+    ims_total = int(raw.get("ims_total") or random.randint(*CONFIG["IMS_SESSION_RANGE"]))
+    sessions  = split_sessions(ims_total)
+
+    _add_telemetry_sample({
         "ts_epoch": now_epoch,
-        "cpu": raw["cpu"],
-        "jitter": raw["jitter"],
-        "delay": raw["delay"],
-        "lambda_": raw["lambda_"],
+        "cpu":      raw["cpu"],
+        "jitter":   raw["jitter"],
+        "delay":    raw["delay"],
+        "lambda_":  raw["lambda_"],
     })
 
-    gradients = compute_gradients(raw, now_epoch)
-    shi = compute_service_health(raw)
-    queue_projection = projected_queue_metrics(raw, gradients)
+    gradients  = compute_gradients(raw, now_epoch)
+    shi        = compute_service_health(raw)
+    queue_proj = projected_queue_metrics(raw, gradients)
 
-    qos = calculate_qos(raw["delay"], raw["jitter"], raw["cpu"])
-    wait = calculate_mm1_wait(raw["lambda_"])
+    qos    = calculate_qos(raw["delay"], raw["jitter"], raw["cpu"])
+    wq     = calculate_mm1_wait(raw["lambda_"])
     status = classify_status(qos)
 
-    decision = resolve_action(raw, sessions, gradients, shi, queue_projection, status)
+    decision = resolve_action(raw, sessions, gradients, shi, queue_proj, status)
+
+    # Action center may escalate status upward — never downgrade
     if severity_rank(decision["status"]) > severity_rank(status):
         status = decision["status"]
 
     return {
-        "cpu": raw["cpu"],
-        "jitter": raw["jitter"],
-        "delay": raw["delay"],
-        "lambda_": raw["lambda_"],
-        "ims_total": ims_total,
+        "cpu":              raw["cpu"],
+        "jitter":           raw["jitter"],
+        "delay":            raw["delay"],
+        "lambda_":          raw["lambda_"],
+        "ims_total":        ims_total,
         "service_sessions": sessions,
-        "qos": qos,
-        "wq": wait,
-        "status": status,
+        "qos":              qos,
+        "wq":               wq,
+        "status":           status,
         "analytics": {
-            "gradients": gradients,
-            "shi": shi,
-            "queue_projection": queue_projection,
+            "gradients":        gradients,
+            "shi":              shi,
+            "queue_projection": queue_proj,
         },
         "action_center": {**decision, "status": status},
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
 
-def normalize_config_value(key: str, value):
-    if key in RANGE_KEYS and isinstance(value, list):
-        return tuple(value)
+# ═══════════════════════════════════════════════════════════════════
+# 10. Config normalisation helpers
+# ═══════════════════════════════════════════════════════════════════
+
+def _normalise_config_value(key: str, value):
+    """Convert incoming JSON values to the correct Python types."""
+    if key in _RANGE_KEYS and isinstance(value, (list, tuple)):
+        lo, hi = float(value[0]), float(value[1])
+        return (min(lo, hi), max(lo, hi))           # always (low, high)
+
     if key == "SERVICE_WEIGHTS" and isinstance(value, dict):
-        return normalize_weights(value)
+        return _normalise_weights(value)
+
+    if key in ("MU", "W_DELAY", "W_JITTER", "W_CPU",
+               "SIMULATION_CHAOS", "SIMULATION_MOMENTUM",
+               "VOIP_JITTER_THRESHOLD", "VIDEO_DELAY_THRESHOLD",
+               "CPU_WARNING_THRESHOLD", "LAMBDA_WARNING_RATIO"):
+        return float(value)
+
+    if key == "PUSH_INTERVAL":
+        return max(1, int(value))                   # minimum 1 s
+
     return value
 
 
-def ensure_push_loop():
+def _validate_config_value(key: str, value) -> tuple:
+    """Return (is_valid, error_message). Empty string means no error."""
+    try:
+        if key == "SIMULATION_CHAOS":
+            if not (0.0 <= float(value) <= 1.5):
+                return False, "must be in [0.0, 1.5]"
+
+        elif key == "SIMULATION_MOMENTUM":
+            if not (0.0 <= float(value) <= 0.97):
+                return False, "must be in [0.0, 0.97]"
+
+        elif key == "MU":
+            if float(value) <= 0:
+                return False, "must be > 0"
+
+        elif key in ("W_DELAY", "W_JITTER", "W_CPU"):
+            if not (0.0 <= float(value) <= 1.0):
+                return False, "must be in [0.0, 1.0]"
+
+        elif key == "ACTION_MODE":
+            if value not in ("auto", "manual"):
+                return False, "must be 'auto' or 'manual'"
+
+        elif key == "FORCED_ACTION":
+            if value not in ACTION_LIBRARY:
+                return False, f"must be one of {sorted(ACTION_LIBRARY)}"
+
+        elif key in _RANGE_KEYS:
+            if not (isinstance(value, (list, tuple)) and len(value) == 2):
+                return False, "must be a two-element list [min, max]"
+            if float(value[0]) >= float(value[1]):
+                return False, "first element must be less than second"
+
+        elif key == "PUSH_INTERVAL":
+            if int(value) < 1:
+                return False, "must be >= 1"
+
+    except (TypeError, ValueError) as exc:
+        return False, f"type error: {exc}"
+
+    return True, ""
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 11. SocketIO push-loop
+# ═══════════════════════════════════════════════════════════════════
+
+_push_lock:   Lock = Lock()
+_push_thread        = None
+
+# Track the last emitted state to build minimal deltas
+_emit_state: dict = {"last_snapshot": None, "last_action_sig": None}
+
+
+def _action_signature(action: dict) -> tuple:
+    if not action:
+        return None
+    return (
+        action.get("scenario"),
+        action.get("status"),
+        action.get("priority"),
+        round(float(action.get("confidence_score", 0.0)), 2),
+        action.get("optimization_result"),
+    )
+
+
+def _build_metric_delta(snapshot: dict) -> dict:
+    """Return only the fields that changed since the last emit.
+    Core telemetry is always included; optional fields are omitted if
+    unchanged, reducing payload size and preventing spurious re-renders."""
+    prev       = _emit_state["last_snapshot"]
+    action_sig = _action_signature(snapshot.get("action_center"))
+    prev_sig   = _emit_state["last_action_sig"]
+
+    delta = {
+        "ts":      snapshot["ts"],
+        "cpu":     snapshot["cpu"],
+        "jitter":  snapshot["jitter"],
+        "delay":   snapshot["delay"],
+        "lambda_": snapshot["lambda_"],
+        "qos":     snapshot["qos"],
+        "wq":      snapshot["wq"],
+        "status":  snapshot["status"],
+    }
+
+    if prev is None or prev.get("ims_total") != snapshot.get("ims_total"):
+        delta["ims_total"] = snapshot["ims_total"]
+
+    if prev is None or prev.get("service_sessions") != snapshot.get("service_sessions"):
+        delta["service_sessions"] = snapshot["service_sessions"]
+
+    if prev is None or action_sig != prev_sig:
+        delta["action_center"] = snapshot["action_center"]
+        _log("decision",
+             f"{snapshot['action_center']['scenario']}  status={snapshot['status']}  "
+             f"confidence={snapshot['action_center']['confidence_score']:.2f}")
+
+    _emit_state["last_snapshot"]  = snapshot
+    _emit_state["last_action_sig"] = action_sig
+    return delta
+
+
+def _push_loop() -> None:
+    while True:
+        try:
+            snapshot = build_snapshot()
+            insert_metric(snapshot)
+            socketio.emit("metric_update", _build_metric_delta(snapshot))
+        except Exception as exc:
+            _log("push_loop", f"error: {exc}")
+        socketio.sleep(CONFIG["PUSH_INTERVAL"])
+
+
+def _ensure_push_loop() -> None:
     global _push_thread
     with _push_lock:
         if _push_thread is None:
             _push_thread = socketio.start_background_task(_push_loop)
 
 
-def build_bootstrap_payload():
-    snapshot = build_snapshot()
-    return {
-        "snapshot": snapshot,
-        "history": fetch_history(30),
-    }
+# ═══════════════════════════════════════════════════════════════════
+# Shared utility
+# ═══════════════════════════════════════════════════════════════════
+
+def _log(channel: str, message: str) -> None:
+    print(f"[{datetime.now():%H:%M:%S}] [{channel}] {message}", flush=True)
 
 
-def build_metric_delta(snapshot: dict):
-    previous = _emit_state["last_snapshot"]
-    action_sig = action_signature(snapshot.get("action_center"))
-    previous_sig = _emit_state["last_action_signature"]
-
-    delta = {
-        "ts": snapshot["ts"],
-        "cpu": snapshot["cpu"],
-        "jitter": snapshot["jitter"],
-        "delay": snapshot["delay"],
-        "lambda_": snapshot["lambda_"],
-        "qos": snapshot["qos"],
-        "wq": snapshot["wq"],
-        "status": snapshot["status"],
-    }
-
-    if previous is None or previous.get("ims_total") != snapshot.get("ims_total"):
-        delta["ims_total"] = snapshot["ims_total"]
-
-    if previous is None or previous.get("service_sessions") != snapshot.get("service_sessions"):
-        delta["service_sessions"] = snapshot["service_sessions"]
-
-    if previous is None or action_sig != previous_sig:
-        delta["action_center"] = snapshot["action_center"]
-        log_event(
-            "decision",
-            f"{snapshot['action_center']['scenario']} status={snapshot['status']} "
-            f"confidence={snapshot['action_center']['confidence_score']:.2f}"
-        )
-
-    _emit_state["last_snapshot"] = snapshot
-    _emit_state["last_action_signature"] = action_sig
-    return delta
-
-
-def _push_loop():
-    while True:
-        try:
-            snapshot = build_snapshot()
-            insert_metric(snapshot)
-            socketio.emit("metric_update", build_metric_delta(snapshot))
-        except Exception as exc:
-            log_event("push_loop", f"error: {exc}")
-        socketio.sleep(CONFIG["PUSH_INTERVAL"])
-
+# ═══════════════════════════════════════════════════════════════════
+# 12. Flask routes
+# ═══════════════════════════════════════════════════════════════════
 
 @app.route("/")
 def index():
-    ensure_push_loop()
+    _ensure_push_loop()
     return render_template("index.html")
 
 
@@ -907,42 +1061,99 @@ def api_mm1_curve():
 
 @app.route("/api/config", methods=["GET", "POST"])
 def api_config():
+    """
+    GET  - return current config + list of available action keys.
+
+    POST - update any subset of allowed keys independently.
+           Each key is validated and normalised before being applied.
+           Unknown / disallowed keys are reported in `ignored` so
+           callers can detect typos without the whole request failing.
+
+    Examples:
+        # Set only chaos — no other keys needed
+        POST /api/config
+        {"SIMULATION_CHAOS": 0.5}
+
+        # Set multiple keys at once
+        POST /api/config
+        {"SIMULATION_CHAOS": 0.8, "MU": 12.0, "PUSH_INTERVAL": 3}
+
+        # Switch to manual mode
+        POST /api/config
+        {"ACTION_MODE": "manual", "FORCED_ACTION": "load_balance_secondary"}
+    """
     if request.method == "POST":
-        data = request.get_json(force=True)
-        for key, value in data.items():
-            if key in UPDATABLE_CONFIG:
-                CONFIG[key] = normalize_config_value(key, value)
-        log_event("config", f"updated keys={sorted(data.keys())}")
+        data = request.get_json(force=True) or {}
+        applied  = {}
+        rejected = {}
+        ignored  = []
+
+        for key, raw_value in data.items():
+            if key not in _UPDATABLE_KEYS:
+                ignored.append(key)
+                continue
+
+            ok, err = _validate_config_value(key, raw_value)
+            if not ok:
+                rejected[key] = err
+                continue
+
+            CONFIG[key] = _normalise_config_value(key, raw_value)
+            applied[key] = CONFIG[key]
+
+        _log("config",
+             f"applied={sorted(applied)} rejected={sorted(rejected)} ignored={ignored}")
+
         return jsonify({
-            "ok": True,
-            "config": {key: CONFIG[key] for key in sorted(UPDATABLE_CONFIG)},
+            "ok":                len(rejected) == 0,
+            "applied":           applied,
+            "rejected":          rejected,
+            "ignored":           ignored,
             "available_actions": sorted(ACTION_LIBRARY.keys()),
+            "config":            {k: CONFIG[k] for k in sorted(_UPDATABLE_KEYS)},
         })
 
+    # GET
     return jsonify({
-        "config": {key: CONFIG[key] for key in sorted(UPDATABLE_CONFIG)},
+        "config":            {k: CONFIG[k] for k in sorted(_UPDATABLE_KEYS)},
         "available_actions": sorted(ACTION_LIBRARY.keys()),
     })
 
 
+# ═══════════════════════════════════════════════════════════════════
+# 13. SocketIO event handlers
+# ═══════════════════════════════════════════════════════════════════
+
 @socketio.on("connect")
 def on_connect():
-    ensure_push_loop()
-    log_event("socket", f"client connected sid={request.sid}")
-    emit("bootstrap_data", build_bootstrap_payload())
+    _ensure_push_loop()
+    _log("socket", f"client connected  sid={request.sid}")
+    # Send the full current snapshot + recent history in one frame so
+    # the client can populate all charts before the first push-loop tick.
+    snapshot = build_snapshot()
+    emit("bootstrap_data", {
+        "snapshot": snapshot,
+        "history":  fetch_history(30),
+    })
 
 
 @socketio.on("disconnect")
 def on_disconnect():
-    log_event("socket", f"client disconnected sid={request.sid}")
+    _log("socket", f"client disconnected  sid={request.sid}")
 
+
+# ═══════════════════════════════════════════════════════════════════
+# 14. Entry point
+# ═══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     init_db()
     _load_csv()
     seed_runtime_state()
-    ensure_push_loop()
-    log_event("startup", f"GPON/IMS Monitor running on http://0.0.0.0:5000 with push_interval={CONFIG['PUSH_INTERVAL']}s")
+    _ensure_push_loop()
+    _log("startup",
+         f"GPON/IMS Monitor  ->  http://0.0.0.0:5000  "
+         f"(push_interval={CONFIG['PUSH_INTERVAL']}s)")
     socketio.run(
         app,
         host="0.0.0.0",

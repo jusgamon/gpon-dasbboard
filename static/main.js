@@ -629,115 +629,129 @@ function getRange(key) {
     ),
   ];
 }
-
-
-if (window.socket) {
-    console.log("Cleaning up existing socket connection");
-    window.socket.removeAllListeners();
-    window.socket.disconnect();
-    window.socket = null;
-}
-
+const UPDATE_INTERVAL_MS = 1000;
+ 
 const badge = document.getElementById("conn-badge");
 let hasEverConnected = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
-
+ 
 function setStatus(state) {
     if (state === "connecting") {
         badge.textContent = "QOŞULUR";
         badge.className = "header-pill conn-warn";
     }
-
     if (state === "online") {
         badge.textContent = "CANLI";
         badge.className = "header-pill conn-on";
         reconnectAttempts = 0;
     }
-
     if (state === "offline") {
         badge.textContent = "OFFLAYN";
         badge.className = "header-pill conn-off";
     }
 }
-
+ 
 setStatus("connecting");
-
-const socket = window.socket ?? io({
+ 
+const socket = io({
     transports: ["websocket"],
     upgrade: false,
     reconnection: true,
-    reconnectionAttempts: MAX_RECONNECT_ATTEMPTS,
-    reconnectionDelay: 1000,
-    reconnectionDelayMax: 5000,
-    timeout: 20000
+    reconnectionAttempts: 5,
+    reconnectionDelay: 3000,
+    reconnectionDelayMax: 10000,
+    timeout: 10000,
+    forceNew: true,
 });
+ 
+async function fetchBootstrap() {
+    try {
+        const [histRes, snapRes] = await Promise.all([
+            fetch("/api/history?limit=30"),
+            fetch("/api/snapshot"),
+        ]);
+ 
+        if (!histRes.ok || !snapRes.ok) {
+            console.warn("[bootstrap] REST request failed, will retry on next connect");
+            return;
+        }
+ 
+        const history  = await histRes.json();
+        const snapshot = await snapRes.json();
+ 
+        applyBootstrap({ history, snapshot });
+        applySnapshot(snapshot, { skipCharts: true, skipLog: true });
+ 
+        console.log("[bootstrap] Loaded via REST");
+    } catch (err) {
+        console.warn("[bootstrap] fetch error:", err.message);
+    }
+}
 
-window.socket = socket;
+let _updateTimer = null;
+ 
+function _startPolling() {
+    if (_updateTimer !== null) return;
+ 
+    _updateTimer = setInterval(() => {
+        if (!socket.connected) return;
+ 
+        socket.emit("request_update", (response) => {
+            if (!response || response.status === "pending") return;
+            applySnapshot(response);
+        });
+    }, UPDATE_INTERVAL_MS);
+}
+ 
+function _stopPolling() {
+    if (_updateTimer !== null) {
+        clearInterval(_updateTimer);
+        _updateTimer = null;
+    }
+}
 
-socket.on("connect", () => {
-    console.log("[socket] Connected successfully with ID:", socket.id);
+socket.on("connect", async () => {
+    console.log("[socket] Connected:", socket.id);
     hasEverConnected = true;
-    setStatus("online");
     reconnectAttempts = 0;
+    setStatus("online");
+    await fetchBootstrap();
+    _startPolling();
 });
-
+ 
 socket.on("disconnect", (reason) => {
     console.warn("[socket] disconnect:", reason);
-
-    if (reason === "io client disconnect") {
-        console.log("Normal client disconnect");
-        return;
-    }
-
-    if (!hasEverConnected) {
-        setStatus("connecting");
-        return;
-    }
-
-    setStatus("offline");
+    _stopPolling();
+    if (reason === "io client disconnect") return;
+    setStatus(hasEverConnected ? "offline" : "connecting");
 });
-
+ 
 socket.on("connect_error", (err) => {
-    console.warn("Socket error:", err.message);
+    console.warn("[socket] connect_error:", err.message);
     reconnectAttempts++;
-    
-    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-        console.error("Max reconnection attempts reached");
-        setStatus("offline");
-    } else {
-        setStatus("connecting");
-    }
+    _stopPolling();
+    setStatus(reconnectAttempts >= MAX_RECONNECT_ATTEMPTS ? "offline" : "connecting");
 });
-
-socket.on("reconnect_attempt", (attemptNumber) => {
-    console.log(`Reconnection attempt ${attemptNumber}`);
+ 
+socket.on("reconnect_attempt", (n) => {
+    console.log(`[socket] reconnect attempt #${n}`);
     setStatus("connecting");
 });
-
-socket.on("reconnect", (attemptNumber) => {
-    console.log(`Reconnected after ${attemptNumber} attempts`);
+ 
+socket.on("reconnect", async (n) => {
+    console.log(`[socket] reconnected after ${n} attempts`);
     hasEverConnected = true;
-    setStatus("online");
     reconnectAttempts = 0;
+    setStatus("online");
+    await fetchBootstrap();
+    _startPolling();
 });
-
+ 
 socket.on("reconnect_failed", () => {
-    console.error("Reconnection failed");
+    console.error("[socket] reconnect failed");
+    _stopPolling();
     setStatus("offline");
-});
-
-socket.on("bootstrap_data", (payload) => {
-    console.log("[socket] Bootstrap data received");
-    applyBootstrap(payload);
-    if (payload?.snapshot) {
-        applySnapshot(payload.snapshot, { skipCharts: true, skipLog: true });
-    }
-});
-
-socket.on("metric_update", (snapshot) => {
-    console.log("[socket] Metric update received");
-    applySnapshot(snapshot);
 });
 
 loadMM1Curve();

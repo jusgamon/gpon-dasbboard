@@ -1,5 +1,4 @@
-fastapi
-uvicorn[standard]
-python-socketio[asyncio]
 jinja2
-aiofiles
+flask
+flask-socketio
+flask-cors

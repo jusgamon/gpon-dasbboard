@@ -1,77 +1,73 @@
 # main.py
-import asyncio
+
+from __future__ import annotations
+
+import threading
 import time
-import os
 from datetime import datetime, timezone
 from typing import Optional
 
-import uvicorn
-import socketio
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from flask import Flask, jsonify, render_template, request
+from flask import request as http_request
+from flask_cors import CORS
+from flask_socketio import SocketIO, emit
 
-from core.config import CONFIG, _UPDATABLE_KEYS, reset_config
-from core.database import init_db, insert_metric, fetch_history, clear_db
-from core.simulation import (
-    seed_runtime_state,
-    reset_simulation,
-    get_raw_metrics,
-    _load_csv,
-)
+from core.actions import ACTION_REGISTRY, reset_decision_state, resolve_action
 from core.analytics import (
     add_telemetry_sample,
     clear_telemetry,
     compute_gradients,
-    split_sessions,
     compute_service_health,
-    projected_queue_metrics
+    projected_queue_metrics,
+    split_sessions,
 )
-from core.actions import (
-    resolve_action,
-    reset_decision_state,
-    ACTION_REGISTRY,
-)
+from core.config import CONFIG, _UPDATABLE_KEYS, reset_config
+from core.database import clear_db, fetch_history, init_db, insert_metric
 from core.models import (
-    calculate_qos,
     calculate_mm1_wait,
+    calculate_qos,
     classify_status,
-    severity_rank,
     mm1_curve,
+    severity_rank,
 )
-from core.utils import _log, _coerce_config_value, _validate_config_value
+from core.simulation import _load_csv, get_raw_metrics, reset_simulation, seed_runtime_state
+from core.utils import _coerce_config_value, _log, _validate_config_value
+from core.store import RomStore
 
 # ---------------------------------------------------------------------------
-# FastAPI & SocketIO setup
+# App & SocketIO setup
 # ---------------------------------------------------------------------------
-sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*", logger=True, transports=["websocket"])
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = Flask(__name__, template_folder="templates", static_folder="static")
+CORS(app)
+
+sio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="threading",
+    ping_timeout=20,
+    ping_interval=25,
+    max_http_buffer_size=1_000_000,
+    logger=True,
+    engineio_logger=True,
 )
-application = socketio.ASGIApp(sio, app)
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-templates = Jinja2Templates(directory="templates")
 
 # ---------------------------------------------------------------------------
-# Application state
+# ROM store
 # ---------------------------------------------------------------------------
-_push_task: Optional[asyncio.Task] = None
-_push_task_lock = asyncio.Lock()
-
-_last_emit: dict = {"action_sig": None, "ims_total": None, "service_sessions": None}
+rom = RomStore()
 
 # ---------------------------------------------------------------------------
-# Snapshot assembly (simulation + logic)
+# Delta helper
 # ---------------------------------------------------------------------------
-def _action_signature(action: dict) -> tuple:
+_last_delta_state: dict = {
+    "action_sig": None,
+    "ims_total": None,
+    "service_sessions": None,
+}
+_last_delta_lock = threading.Lock()
+
+
+def _action_signature(action: Optional[dict]) -> Optional[tuple]:
     if not action:
         return None
     return (
@@ -81,147 +77,177 @@ def _action_signature(action: dict) -> tuple:
         action.get("optimization_result"),
     )
 
+
 def _build_delta(snapshot: dict) -> dict:
     action_sig = _action_signature(snapshot.get("action_center"))
-    delta = {
-        "ts": snapshot["ts"],
-        "cpu": snapshot["cpu"],
-        "jitter": snapshot["jitter"],
-        "delay": snapshot["delay"],
+
+    delta: dict = {
+        "ts":      snapshot["ts"],
+        "cpu":     snapshot["cpu"],
+        "jitter":  snapshot["jitter"],
+        "delay":   snapshot["delay"],
         "lambda_": snapshot["lambda_"],
-        "qos": snapshot["qos"],
-        "wq": snapshot["wq"],
-        "status": snapshot["status"],
+        "qos":     snapshot["qos"],
+        "wq":      snapshot["wq"],
+        "status":  snapshot["status"],
     }
-    if snapshot.get("ims_total") != _last_emit["ims_total"]:
-        delta["ims_total"] = snapshot["ims_total"]
-    if snapshot.get("service_sessions") != _last_emit["service_sessions"]:
-        delta["service_sessions"] = snapshot["service_sessions"]
-    if action_sig != _last_emit["action_sig"]:
-        delta["action_center"] = snapshot["action_center"]
-        _log("decision",
-             f"{snapshot['action_center']['scenario']}  "
-             f"status={snapshot['status']}  "
-             f"confidence={snapshot['action_center']['confidence_score']:.2f}")
-    _last_emit["action_sig"] = action_sig
-    _last_emit["ims_total"] = snapshot.get("ims_total")
-    _last_emit["service_sessions"] = snapshot.get("service_sessions")
+
+    with _last_delta_lock:
+        if snapshot.get("ims_total") != _last_delta_state["ims_total"]:
+            delta["ims_total"] = snapshot["ims_total"]
+            _last_delta_state["ims_total"] = snapshot["ims_total"]
+
+        if snapshot.get("service_sessions") != _last_delta_state["service_sessions"]:
+            delta["service_sessions"] = snapshot["service_sessions"]
+            _last_delta_state["service_sessions"] = snapshot["service_sessions"]
+
+        if action_sig != _last_delta_state["action_sig"]:
+            delta["action_center"] = snapshot["action_center"]
+            _last_delta_state["action_sig"] = action_sig
+            _log(
+                "decision",
+                f"{snapshot['action_center']['scenario']}  "
+                f"status={snapshot['status']}  "
+                f"confidence={snapshot['action_center']['confidence_score']:.2f}",
+            )
+
     return delta
 
-def build_snapshot() -> dict:
+
+# ---------------------------------------------------------------------------
+# Snapshot builder
+# ---------------------------------------------------------------------------
+def _build_snapshot() -> dict:
     raw = get_raw_metrics()
     now_epoch = time.time()
     ims_total = int(raw.get("ims_total") or 0)
     sessions = split_sessions(ims_total)
+
     add_telemetry_sample({
         "ts_epoch": now_epoch,
-        "cpu": raw["cpu"],
-        "jitter": raw["jitter"],
-        "delay": raw["delay"],
+        "cpu":     raw["cpu"],
+        "jitter":  raw["jitter"],
+        "delay":   raw["delay"],
         "lambda_": raw["lambda_"],
     })
-    gradients = compute_gradients(raw, now_epoch)
-    shi = compute_service_health(raw)
+
+    gradients  = compute_gradients(raw, now_epoch)
+    shi        = compute_service_health(raw)
     queue_proj = projected_queue_metrics(raw, gradients)
-    qos = calculate_qos(raw["delay"], raw["jitter"], raw["cpu"])
-    wq = calculate_mm1_wait(raw["lambda_"])
-    status = classify_status(qos)
-    decision = resolve_action(raw, sessions, gradients, shi, queue_proj, status, CONFIG)
+    qos        = calculate_qos(raw["delay"], raw["jitter"], raw["cpu"])
+    wq         = calculate_mm1_wait(raw["lambda_"])
+    status     = classify_status(qos)
+    decision   = resolve_action(raw, sessions, gradients, shi, queue_proj, status, CONFIG)
+
     if severity_rank(decision["status"]) > severity_rank(status):
         status = decision["status"]
+
     return {
-        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "cpu": raw["cpu"],
-        "jitter": raw["jitter"],
-        "delay": raw["delay"],
-        "lambda_": raw["lambda_"],
-        "ims_total": ims_total,
+        "ts":               datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "cpu":              raw["cpu"],
+        "jitter":           raw["jitter"],
+        "delay":            raw["delay"],
+        "lambda_":          raw["lambda_"],
+        "ims_total":        ims_total,
         "service_sessions": sessions,
-        "qos": qos,
-        "wq": wq,
-        "status": status,
+        "qos":              qos,
+        "wq":               wq,
+        "status":           status,
         "analytics": {
-            "gradients": gradients,
-            "shi": shi,
+            "gradients":        gradients,
+            "shi":              shi,
             "queue_projection": queue_proj,
         },
         "action_center": {**decision, "status": status},
     }
 
+
 # ---------------------------------------------------------------------------
-# Background push loop
+# Simulation loop
 # ---------------------------------------------------------------------------
-async def push_loop():
-    while True:
+_sim_thread: Optional[threading.Thread] = None
+_sim_stop = threading.Event()
+
+
+def _simulation_loop() -> None:
+    while not _sim_stop.is_set():
         try:
-            snapshot = await asyncio.to_thread(build_snapshot)
-            await asyncio.to_thread(insert_metric, snapshot)
-            delta = await asyncio.to_thread(_build_delta, snapshot)
-            await sio.emit("metric_update", delta)
+            snapshot = _build_snapshot()
+            insert_metric(snapshot)
+            rom.set(snapshot)
         except Exception as exc:
-            _log("push_loop", f"error: {exc}")
-        await asyncio.sleep(CONFIG["PUSH_INTERVAL"])
+            _log("sim_loop", f"error: {exc}")
+        _sim_stop.wait(CONFIG["PUSH_INTERVAL"])
+
+
+def _start_simulation() -> None:
+    global _sim_thread
+    _sim_stop.clear()
+    if _sim_thread is None or not _sim_thread.is_alive():
+        _sim_thread = threading.Thread(
+            target=_simulation_loop, name="sim_loop", daemon=True
+        )
+        _sim_thread.start()
 
 # ---------------------------------------------------------------------------
-# SocketIO events
+# Socket
 # ---------------------------------------------------------------------------
-connected_clients = set()
+connected_clients: set[str] = set()
 
-@sio.event
-async def connect(sid, environ):
+@sio.on("connect")
+def on_connect():
+    sid = request.sid
     connected_clients.add(sid)
+    _log("connect", f"sid={sid} total={len(connected_clients)}")
 
-    global _push_task
 
-    async with _push_task_lock:
-        if _push_task is None or _push_task.done():
-            _push_task = asyncio.create_task(push_loop())
-
-    snapshot = await asyncio.to_thread(build_snapshot)
-    history = await asyncio.to_thread(fetch_history, 30)
-    await sio.emit("bootstrap_data", {
-        "snapshot": snapshot,
-        "history": history,
-    }, to=sid)
-
-@sio.event
-async def disconnect(sid):
+@sio.on("disconnect")
+def on_disconnect():
+    sid = request.sid
     connected_clients.discard(sid)
+    _log("disconnect", f"sid={sid} remaining={len(connected_clients)}")
 
-    global _push_task
 
-    if not connected_clients and _push_task:
-        _push_task.cancel()
-        _push_task = None
+@sio.on("request_update")
+def on_request_update():
+    snapshot = rom.get()
+    if snapshot is None:
+        return {"status": "pending"}
+    return _build_delta(snapshot)
+
 
 # ---------------------------------------------------------------------------
-# REST API endpoints
+# REST endpoints
 # ---------------------------------------------------------------------------
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    return templates.TemplateResponse(request, "index.html")
+@app.get("/")
+def index():
+    return render_template("index.html")
+
 
 @app.get("/api/snapshot")
-async def api_snapshot():
-    snap = await asyncio.to_thread(build_snapshot)
-    await asyncio.to_thread(insert_metric, snap)
-    return snap
+def api_snapshot():
+    snapshot = rom.get() or _build_snapshot()
+    insert_metric(snapshot)
+    return jsonify(snapshot)
+
 
 @app.get("/api/history")
-async def api_history(limit: int = 60):
-    return await asyncio.to_thread(fetch_history, limit)
+def api_history():
+    limit = http_request.args.get("limit", 60, type=int)
+    return jsonify(fetch_history(limit))
+
 
 @app.get("/api/mm1_curve")
-async def api_mm1_curve(mu: float = None):
-    mu = mu or CONFIG["MU"]
-    return {"mu": mu, "curve": await asyncio.to_thread(mm1_curve, mu)}
+def api_mm1_curve():
+    mu = http_request.args.get("mu", CONFIG["MU"], type=float)
+    return jsonify({"mu": mu, "curve": mm1_curve(mu)})
 
-@app.api_route("/api/config", methods=["GET", "POST"])
-async def api_config(request: Request):
-    if request.method == "POST":
-        data = await request.json() if request.headers.get("content-type") == "application/json" else {}
-        applied = {}
-        rejected = {}
+
+@app.route("/api/config", methods=["GET", "POST"])
+def api_config():
+    if http_request.method == "POST":
+        data: dict = http_request.get_json(silent=True) or {}
+        applied, rejected = {}, {}
         ignored = [k for k in data if k not in _UPDATABLE_KEYS]
         for key, value in data.items():
             if key not in _UPDATABLE_KEYS:
@@ -233,39 +259,60 @@ async def api_config(request: Request):
                 CONFIG[key] = _coerce_config_value(key, value)
                 applied[key] = CONFIG[key]
         _log("config", f"applied={sorted(applied)} rejected={sorted(rejected)}")
-        return {
-            "ok": not rejected,
-            "applied": applied,
-            "rejected": rejected,
-            "ignored": ignored,
+        return jsonify({
+            "ok":                not rejected,
+            "applied":           applied,
+            "rejected":          rejected,
+            "ignored":           ignored,
             "available_actions": sorted(ACTION_REGISTRY),
-            "config": dict(CONFIG),
-        }
-    # GET
-    return {"config": dict(CONFIG), "available_actions": sorted(ACTION_REGISTRY)}
+            "config":            dict(CONFIG),
+        })
+    return jsonify({"config": dict(CONFIG), "available_actions": sorted(ACTION_REGISTRY)})
+
 
 @app.post("/api/reset")
-async def api_reset():
-    """Reset simulation and clear all stored data / memory."""
-    await asyncio.to_thread(reset_simulation)
-    await asyncio.to_thread(clear_telemetry)
-    await asyncio.to_thread(reset_decision_state)
-    await asyncio.to_thread(clear_db)
-    await asyncio.to_thread(init_db)
-    await asyncio.to_thread(seed_runtime_state)
-    await asyncio.to_thread(reset_config)
-    return {"status": "reset", "message": "Simulation restarted, storage cleared."}
+def api_reset():
+    reset_simulation()
+    clear_telemetry()
+    reset_decision_state()
+    clear_db()
+    init_db()
+    seed_runtime_state()
+    reset_config()
+    rom.clear()
+    return jsonify({"status": "reset", "message": "Simulation restarted, storage cleared."})
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/api/summary")
+def api_summary():
+    snapshot = rom.get()
+    if snapshot is None:
+        return ("", 204)
+    action = snapshot.get("action_center") or {}
+    return jsonify({
+        "ts":                  snapshot["ts"],
+        "status":              snapshot["status"],
+        "qos":                 snapshot["qos"],
+        "scenario":            action.get("scenario"),
+        "diagnosis":           action.get("diagnosis") or action.get("analysis"),
+        "rationale":           action.get("rationale") or action.get("decision"),
+        "proposed_patch":      action.get("proposed_patch") or action.get("optimization"),
+        "optimization_result": action.get("optimization_result"),
+        "confidence_score":    action.get("confidence_score"),
+    })
+
+
 # ---------------------------------------------------------------------------
-# Startup
+# Initialisation
 # ---------------------------------------------------------------------------
-@app.on_event("startup")
-async def startup_event():
+def _initialise() -> None:
     init_db()
     _load_csv()
     seed_runtime_state()
-    _log("startup", f"GPON/IMS Monitor  →  http://0.0.0.0:5000  (push_interval={CONFIG['PUSH_INTERVAL']}s)")
+    _start_simulation()
+
+
+_initialise()
 
 if __name__ == "__main__":
-    uvicorn.run(application, host="0.0.0.0", port=5000, log_level="info")
+    sio.run(app, host="0.0.0.0", port=5000, debug=False, log_output=True, allow_unsafe_werkzeug=True)
